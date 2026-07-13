@@ -96,7 +96,12 @@ use crate::{
     delegate_virtual_pointer,
 };
 
+/// Timeout for XDG activation tokens (10 seconds).
 pub const XDG_ACTIVATION_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time window in seconds allowed for a VR client to activate a requested lease before we check and
+/// auto-suspend the idle GPU.
+pub const LEASE_GC_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
@@ -691,13 +696,7 @@ delegate_virtual_pointer!(State);
 
 impl DrmLeaseHandler for State {
     fn drm_lease_state(&mut self, node: DrmNode) -> &mut DrmLeaseState {
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .drm_lease_state
-            .as_mut()
-            .unwrap()
+        self.backend.tty().drm_lease_state(node).unwrap()
     }
 
     fn lease_request(
@@ -706,32 +705,93 @@ impl DrmLeaseHandler for State {
         request: DrmLeaseRequest,
     ) -> Result<DrmLeaseBuilder, LeaseRejected> {
         debug!(
-            "Received lease request for {} connectors",
+            "received DRM lease request for {} connectors on {node:?}",
             request.connectors.len()
         );
-        self.backend
+
+        let tty = self.backend.tty();
+        match tty.resume_device(&mut self.niri, node, false) {
+            Ok(true) => tty.update_dmabuf_feedbacks(&mut self.niri),
+            Ok(false) => {}
+            Err(()) => {
+                if !tty.is_device_resuming_for_lease(node) {
+                    warn!("GPU resume failed for VR lease request; rejecting lease");
+                    return Err(LeaseRejected::default());
+                }
+            }
+        }
+
+        let generation = match self.backend.tty().next_pending_lease_generation(node) {
+            Some(gen) => gen,
+            None => {
+                warn!("device {node:?} not found for DRM lease request");
+                return Err(LeaseRejected::default());
+            }
+        };
+
+        let timer = smithay::reexports::calloop::timer::Timer::from_duration(LEASE_GC_TIMEOUT);
+        let token = match self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                if let Some(tty) = state.backend.tty_checked() {
+                    tty.pending_lease_timer_elapsed(node, generation);
+                    tty.check_suspend_device(&mut state.niri, node);
+                }
+                smithay::reexports::calloop::timer::TimeoutAction::Drop
+            }) {
+            Ok(token) => token,
+            Err(err) => {
+                error!("failed to register DRM lease request timeout for {node:?}: {err:?}");
+                return self.backend.tty().lease_request(node, request);
+            }
+        };
+
+        if let Err(token) = self
+            .backend
             .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .lease_request(request)
+            .set_pending_lease_timer(&mut self.niri, node, token)
+        {
+            self.niri.event_loop.remove(token);
+            warn!("device {node:?} not found for DRM lease request");
+            return Err(LeaseRejected::default());
+        }
+
+        self.backend.tty().lease_request(node, request)
     }
 
     fn new_active_lease(&mut self, node: DrmNode, lease: DrmLease) {
-        debug!("Lease success");
-        self.backend
+        debug!("new active DRM lease on {node:?}");
+        let tty = self.backend.tty();
+        match tty.resume_device(&mut self.niri, node, false) {
+            Ok(true) => tty.update_dmabuf_feedbacks(&mut self.niri),
+            Ok(false) => {}
+            Err(()) => {
+                warn!("GPU is still resuming during DRM lease activation");
+            }
+        }
+
+        if !self
+            .backend
             .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .new_lease(lease);
+            .clear_pending_lease_timer(&mut self.niri, node)
+        {
+            warn!("device {node:?} not found for new active DRM lease");
+            return;
+        }
+
+        if !self.backend.tty().add_active_lease(node, lease) {
+            warn!("device {node:?} not found for new active DRM lease");
+        }
     }
 
     fn lease_destroyed(&mut self, node: DrmNode, lease_id: u32) {
-        debug!("Destroyed lease");
-        let Some(device) = self.backend.tty().get_device_from_node(node) else {
-            warn!("lease destroyed for unknown DRM device {node:?}");
+        debug!("DRM lease {lease_id} destroyed on {node:?}");
+        if !self.backend.tty().remove_active_lease(node, lease_id) {
+            warn!("device {node:?} not found for destroyed DRM lease");
             return;
-        };
-        device.remove_lease(lease_id);
+        }
+
         // kick off the suspend debounce now that a lease is gone
         self.backend
             .tty()

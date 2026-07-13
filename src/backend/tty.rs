@@ -324,6 +324,9 @@ pub struct OutputDevice {
     pub drm_lease_state: Option<DrmLeaseState>,
     non_desktop_connectors: HashSet<(connector::Handle, crtc::Handle)>,
     active_leases: Vec<DrmLease>,
+    // Pending lease requests keep the GPU awake until the lease becomes active or times out.
+    pending_lease_timer: Option<RegistrationToken>,
+    pending_lease_generation: u64,
 }
 
 // A connected, but not necessarily enabled, crtc.
@@ -1708,7 +1711,6 @@ impl Tty {
                 );
                 return Ok(());
             }
-
             let render_target =
                 early_render_node.and_then(|rn| rn.dev_path().map(|path| (path, rn.dev_id())));
 
@@ -1960,6 +1962,8 @@ impl Tty {
             drm_lease_state,
             active_leases: Vec::new(),
             non_desktop_connectors: HashSet::new(),
+            pending_lease_timer: None,
+            pending_lease_generation: 0,
         };
         match self.devices.entry(node) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1994,7 +1998,12 @@ impl Tty {
                 .get(&key)
                 .map(|power| !power.suspended && !power.waking_up)
                 .unwrap_or(false)
-            && is_device_idle_and_last(self, node);
+            && is_device_idle_and_last(self, node)
+            && self
+                .devices
+                .get(&node)
+                .map(|d| d.pending_lease_timer.is_none())
+                .unwrap_or(true);
 
         if !should_suspend {
             if let Some(power) = self.gpu_power.get_mut(&key) {
@@ -2454,6 +2463,9 @@ impl Tty {
                     WakeupState::Cancelled;
             }
             self.gpu_power.remove(&key);
+        }
+        if let Some(token) = device.pending_lease_timer.take() {
+            niri.event_loop.remove(token);
         }
 
         if let Some(lease_state) = &mut device.drm_lease_state {
@@ -3921,8 +3933,98 @@ impl Tty {
         }
     }
 
-    pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
-        self.devices.get_mut(&node)
+    pub fn drm_lease_state(&mut self, node: DrmNode) -> Option<&mut DrmLeaseState> {
+        self.devices.get_mut(&node)?.drm_lease_state.as_mut()
+    }
+
+    pub fn lease_request(
+        &mut self,
+        node: DrmNode,
+        request: DrmLeaseRequest,
+    ) -> Result<DrmLeaseBuilder, LeaseRejected> {
+        self.devices
+            .get(&node)
+            .ok_or_else(LeaseRejected::default)?
+            .lease_request(request)
+    }
+
+    pub fn add_active_lease(&mut self, node: DrmNode, lease: DrmLease) -> bool {
+        let Some(device) = self.devices.get_mut(&node) else {
+            return false;
+        };
+        device.new_lease(lease);
+        true
+    }
+
+    pub fn remove_active_lease(&mut self, node: DrmNode, lease_id: u32) -> bool {
+        let Some(device) = self.devices.get_mut(&node) else {
+            return false;
+        };
+        device.remove_lease(lease_id);
+        true
+    }
+
+    pub fn is_device_resuming_for_lease(&self, node: DrmNode) -> bool {
+        let key = self.gpu_power_key(node);
+        self.gpu_power
+            .get(&key)
+            .map(|power| power.suspended || power.waking_up)
+            .unwrap_or(false)
+    }
+
+    pub fn max_resume_attempts(&self) -> usize {
+        WAKEUP_ATTEMPTS
+    }
+
+    pub fn clear_wakeup_lock(&mut self, node: DrmNode) {
+        let key = self.gpu_power_key(node);
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            power.waking_up = false;
+            power.resume_attempts = 0;
+        }
+    }
+
+    pub fn next_pending_lease_generation(&mut self, node: DrmNode) -> Option<u64> {
+        let device = self.devices.get_mut(&node)?;
+        device.pending_lease_generation = device.pending_lease_generation.wrapping_add(1);
+        Some(device.pending_lease_generation)
+    }
+
+    pub fn set_pending_lease_timer(
+        &mut self,
+        niri: &mut Niri,
+        node: DrmNode,
+        token: RegistrationToken,
+    ) -> Result<(), RegistrationToken> {
+        let Some(device) = self.devices.get_mut(&node) else {
+            return Err(token);
+        };
+
+        if let Some(old_token) = device.pending_lease_timer.replace(token) {
+            niri.event_loop.remove(old_token);
+        }
+
+        Ok(())
+    }
+
+    pub fn clear_pending_lease_timer(&mut self, niri: &mut Niri, node: DrmNode) -> bool {
+        let Some(device) = self.devices.get_mut(&node) else {
+            return false;
+        };
+
+        if let Some(token) = device.pending_lease_timer.take() {
+            niri.event_loop.remove(token);
+        }
+
+        true
+    }
+
+    pub fn pending_lease_timer_elapsed(&mut self, node: DrmNode, generation: u64) {
+        if let Some(device) = self.devices.get_mut(&node) {
+            if device.pending_lease_generation == generation {
+                device.pending_lease_timer = None;
+            }
+        }
     }
 
     pub fn disconnected_connector_name_by_name_match(&self, target: &str) -> Option<OutputName> {

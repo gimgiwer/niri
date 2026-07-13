@@ -76,6 +76,10 @@ debug {
 
 On NVIDIA, suspend is skipped unless video memory preservation is on — without it, suspending can kill the EGL context.
 
+### VR headset presence
+
+While a VR headset is physically connected (detected as a non-desktop DRM connector), its GPU is kept awake regardless of whether a VR application is currently using it. The GPU only becomes eligible for suspend once the headset is unplugged.
+
 ### eGPU connection latency
 
 Some eGPUs are slow to come back after hotplug. Niri opens the render node from a background thread, so a slow PCIe resume doesn't block the compositor.
