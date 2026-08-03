@@ -2795,41 +2795,49 @@ impl<W: LayoutElement> Layout<W> {
         self.update_render_elements_time = self.clock.now();
 
         let zoom = self.overview_zoom();
+        let is_overview = self.overview_open || self.overview_progress.is_some();
+
         let moving_info = match &self.interactive_move {
             Some(InteractiveMoveState::Moving(m))
                 if output.is_none_or(|output| m.output == *output) =>
             {
                 let pos_within_output = m.tile_render_location(zoom);
-                Some((m.output.clone(), pos_within_output))
+                Some((
+                    m.output.clone(),
+                    m.pointer_pos_within_output,
+                    pos_within_output,
+                ))
             }
             _ => None,
         };
 
-        if let Some((move_output, pos_within_output)) = moving_info {
-            // Compute view rect relative to active workspace in overview mode
-            // so backdrop and blur shader sampling align with workspace background.
-            let ws_offset = if zoom < 1.0 {
-                self.monitor_for_output(&move_output)
-                    .and_then(|mon| {
-                        mon.workspace_under(pos_within_output)
-                            .map(|(_ws, geo)| geo.loc)
-                            .or_else(|| {
-                                mon.workspaces_render_geo()
-                                    .nth(mon.active_workspace_idx())
-                                    .map(|geo| geo.loc)
-                            })
-                    })
-                    .unwrap_or_default()
-            } else {
-                Point::default()
-            };
+        if let Some((move_output, pointer_pos, pos_within_output)) = moving_info {
+            if let Some(mon) = self.monitor_for_output(&move_output) {
+                // Compute view rect relative to target workspace in overview mode
+                // so backdrop and blur shader sampling align with workspace background.
+                let ws_offset = if is_overview {
+                    mon.workspace_under(pointer_pos)
+                        .map(|(_ws, geo)| geo.loc)
+                        .or_else(|| {
+                            mon.workspaces_render_geo()
+                                .nth(mon.active_workspace_idx())
+                                .map(|geo| geo.loc)
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Point::default()
+                };
 
-            let pos_within_ws = pos_within_output - ws_offset;
-            let view_rect = Rectangle::new(pos_within_ws.upscale(-1.), output_size(&move_output))
-                .downscale(zoom);
+                let pos_within_ws = pos_within_output - ws_offset;
+                let view_rect =
+                    Rectangle::new(pos_within_ws.upscale(-1.), output_size(&move_output))
+                        .downscale(zoom);
 
-            if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
-                move_.tile.update_render_elements(true, view_rect);
+                if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+                    if move_.output == move_output {
+                        move_.tile.update_render_elements(true, view_rect);
+                    }
+                }
             }
         }
 
