@@ -3929,3 +3929,31 @@ proptest! {
         check_ops_with_options(options, ops);
     }
 }
+
+#[test]
+fn interactive_move_overview_view_rect() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::ToggleOverview,
+        Op::InteractiveMoveBegin {
+            window: 0,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveUpdate {
+            window: 0,
+            dx: 50.,
+            dy: 50.,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveEnd { window: 0 },
+    ];
+
+    check_ops(ops);
+}

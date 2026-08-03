@@ -2795,21 +2795,40 @@ impl<W: LayoutElement> Layout<W> {
         self.update_render_elements_time = self.clock.now();
 
         let zoom = self.overview_zoom();
-        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
-            if output.is_none_or(|output| move_.output == *output) {
-                let pos_within_output = move_.tile_render_location(zoom);
+        let moving_info = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(m))
+                if output.is_none_or(|output| m.output == *output) =>
+            {
+                let pos_within_output = m.tile_render_location(zoom);
+                Some((m.output.clone(), pos_within_output))
+            }
+            _ => None,
+        };
 
-                // We're not on any specific workspace so we can't compute a "workspace view" rect.
-                // Let's instead compute a rect relative to the output.
-                //
-                // FIXME: we could make the colors match up better in the overview by figuring out
-                // where a centered workspace would currently be, and computing the view rect
-                // against that. Since most of the time the dragged window will be on a centered
-                // workspace.
-                let view_rect =
-                    Rectangle::new(pos_within_output.upscale(-1.), output_size(&move_.output))
-                        .downscale(zoom);
+        if let Some((move_output, pos_within_output)) = moving_info {
+            // Compute view rect relative to active workspace in overview mode
+            // so backdrop and blur shader sampling align with workspace background.
+            let ws_offset = if zoom < 1.0 {
+                self.monitor_for_output(&move_output)
+                    .and_then(|mon| {
+                        mon.workspace_under(pos_within_output)
+                            .map(|(_ws, geo)| geo.loc)
+                            .or_else(|| {
+                                mon.workspaces_render_geo()
+                                    .nth(mon.active_workspace_idx())
+                                    .map(|geo| geo.loc)
+                            })
+                    })
+                    .unwrap_or_default()
+            } else {
+                Point::default()
+            };
 
+            let pos_within_ws = pos_within_output - ws_offset;
+            let view_rect = Rectangle::new(pos_within_ws.upscale(-1.), output_size(&move_output))
+                .downscale(zoom);
+
+            if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
                 move_.tile.update_render_elements(true, view_rect);
             }
         }
