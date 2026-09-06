@@ -341,10 +341,10 @@ See the [window effects page](./Window-Effects.md) for an overview of background
 // These are the default values:
 blur {
     // off
-    passes 3
-    offset 3
+    passes 5
+    offset 1
     noise 0.02
-    saturation 1.5
+    saturation 1.3
 }
 ```
 

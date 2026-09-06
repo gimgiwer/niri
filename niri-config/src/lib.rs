@@ -1673,10 +1673,10 @@ mod tests {
             },
             blur: Blur {
                 off: false,
-                passes: 3,
-                offset: 3.0,
+                passes: 5,
+                offset: 1.0,
                 noise: 0.02,
-                saturation: 1.5,
+                saturation: 1.3,
             },
             gestures: Gestures {
                 dnd_edge_view_scroll: DndEdgeViewScroll {
