@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::iter::zip;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -100,6 +100,7 @@ pub struct Tty {
     update_output_config_on_resume: bool,
     // Whether the debug tinting is enabled.
     debug_tint: bool,
+    monitors_active: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
@@ -377,6 +378,12 @@ struct Surface {
     connector: connector::Handle,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
+    /// Base hardware calibration LUT from ICC profile.
+    base_vcgt_lut: Option<Vec<u16>>,
+    /// Client gamma LUT (e.g. night light).
+    client_gamma: Option<Vec<u16>>,
+    /// Currently loaded ICC profile path.
+    loaded_icc_profile: Option<PathBuf>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
     /// Tracy frame that goes from vblank to vblank.
@@ -400,6 +407,169 @@ struct GammaProps {
     gamma_lut: property::Handle,
     gamma_lut_size: property::Handle,
     previous_blob: Option<NonZeroU64>,
+}
+
+impl Surface {
+    fn get_gamma_size(&self, device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<u32> {
+        if let Some(gamma_props) = &self.gamma_props {
+            gamma_props.gamma_size(device)
+        } else {
+            let info = device.get_crtc(crtc).context("error getting crtc info")?;
+            Ok(info.gamma_length())
+        }
+    }
+
+    fn compute_effective_gamma(&self) -> Option<Vec<u16>> {
+        let res = match (&self.base_vcgt_lut, &self.client_gamma) {
+            (Some(base), Some(client)) => Some(crate::color::vcgt::fuse_gamma(base, client)),
+            (Some(base), None) => Some(base.clone()),
+            (None, Some(client)) => Some(client.clone()),
+            (None, None) => None,
+        };
+        res.filter(|lut| !lut.is_empty())
+    }
+
+    fn apply_effective_gamma(
+        &mut self,
+        device: &DrmDevice,
+        crtc: crtc::Handle,
+        is_active: bool,
+    ) -> anyhow::Result<()> {
+        let effective = self.compute_effective_gamma();
+        if !is_active {
+            self.pending_gamma_change = Some(effective);
+            return Ok(());
+        }
+
+        let ramp = effective.as_deref();
+        let res = if let Some(gamma_props) = &mut self.gamma_props {
+            gamma_props.set_gamma(device, ramp)
+        } else {
+            set_gamma_for_crtc(device, crtc, ramp)
+        };
+
+        match res {
+            Ok(()) => {
+                // Applied live; clear pending change to avoid stale overwrites in queue_frame.
+                self.pending_gamma_change = None;
+                Ok(())
+            }
+            Err(err) => {
+                // Queue for retry on the next frame if DRM failed with a transient error.
+                if is_transient_drm_error(&err) {
+                    self.pending_gamma_change = Some(effective);
+                } else {
+                    self.pending_gamma_change = None;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn update_icc_profile(
+        &mut self,
+        device: &DrmDevice,
+        crtc: crtc::Handle,
+        profile_path: Option<&Path>,
+        is_active: bool,
+    ) {
+        let already_loaded = self.loaded_icc_profile.as_deref() == profile_path
+            && (profile_path.is_none() || self.base_vcgt_lut.is_some());
+        if already_loaded {
+            return;
+        }
+
+        if let Some(path) = profile_path {
+            match crate::color::vcgt::Vcgt::from_file(path) {
+                Ok(vcgt) => {
+                    if vcgt.is_empty() {
+                        warn!(
+                            "output {:?}: ICC profile {:?} has empty VCGT table",
+                            self.name.connector, path
+                        );
+                        self.loaded_icc_profile = None;
+                        self.base_vcgt_lut = None;
+                    } else {
+                        match self.get_gamma_size(device, crtc) {
+                            Ok(gamma_size) if gamma_size > 0 => {
+                                let resampled = vcgt.resample(gamma_size as usize);
+                                let drm_lut = resampled.to_drm_lut();
+                                self.loaded_icc_profile = Some(path.to_path_buf());
+                                self.base_vcgt_lut = Some(drm_lut);
+                                debug!(
+                                    "output {:?}: loaded ICC profile {:?} with VCGT (resampled to {gamma_size} points)",
+                                    self.name.connector, path
+                                );
+                            }
+                            Ok(_) => {
+                                warn!(
+                                    "output {:?}: gamma LUT size is 0, hardware does not support calibration",
+                                    self.name.connector
+                                );
+                                self.loaded_icc_profile = None;
+                                self.base_vcgt_lut = None;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "output {:?}: failed to query gamma LUT size for ICC profile: {err:?}",
+                                    self.name.connector
+                                );
+                                self.loaded_icc_profile = None;
+                                self.base_vcgt_lut = None;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "output {:?}: failed to load ICC profile {:?}: {err}",
+                        self.name.connector, path
+                    );
+                    self.loaded_icc_profile = None;
+                    self.base_vcgt_lut = None;
+                }
+            }
+        } else {
+            self.loaded_icc_profile = None;
+            self.base_vcgt_lut = None;
+            debug!("output {:?}: cleared ICC profile", self.name.connector);
+        }
+
+        if let Err(err) = self.apply_effective_gamma(device, crtc, is_active) {
+            warn!(
+                "output {:?}: error applying gamma after ICC update: {err:?}",
+                self.name.connector
+            );
+        }
+    }
+}
+
+pub(crate) fn is_transient_drm_error(err: &anyhow::Error) -> bool {
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        if io_err.raw_os_error() == Some(libc::EBUSY)
+            || io_err.raw_os_error() == Some(libc::EAGAIN)
+            || io_err.raw_os_error() == Some(libc::EINTR)
+            || io_err.kind() == std::io::ErrorKind::WouldBlock
+            || io_err.kind() == std::io::ErrorKind::Interrupted
+        {
+            return true;
+        }
+    }
+    if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
+        if io_err.raw_os_error() == Some(libc::EBUSY)
+            || io_err.raw_os_error() == Some(libc::EAGAIN)
+            || io_err.raw_os_error() == Some(libc::EINTR)
+            || io_err.kind() == std::io::ErrorKind::WouldBlock
+            || io_err.kind() == std::io::ErrorKind::Interrupted
+        {
+            return true;
+        }
+    }
+    let msg = format!("{err:?}");
+    msg.contains("EBUSY")
+        || msg.contains("Device or resource busy")
+        || msg.contains("Interrupted system call")
+        || msg.contains("EINTR")
 }
 
 struct ConnectorProperties<'a> {
@@ -508,6 +678,7 @@ impl Tty {
             dmabuf_global: None,
             update_output_config_on_resume: false,
             debug_tint: false,
+            monitors_active: true,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -694,14 +865,21 @@ impl Tty {
                         }
 
                         if let Some(ramp) = surface.pending_gamma_change.take() {
-                            let ramp = ramp.as_deref();
+                            let ramp_slice = ramp.as_deref();
                             let res = if let Some(gamma_props) = &mut surface.gamma_props {
-                                gamma_props.set_gamma(&device.drm, ramp)
+                                gamma_props.set_gamma(&device.drm, ramp_slice)
                             } else {
-                                set_gamma_for_crtc(&device.drm, *crtc, ramp)
+                                set_gamma_for_crtc(&device.drm, *crtc, ramp_slice)
                             };
                             if let Err(err) = res {
                                 warn!("error applying pending gamma change: {err:?}");
+                                if is_transient_drm_error(&err) && surface.pending_gamma_change.is_none() {
+                                    surface.pending_gamma_change = Some(ramp);
+                                }
+                            }
+                        } else if surface.base_vcgt_lut.is_some() || surface.client_gamma.is_some() {
+                            if let Err(err) = surface.apply_effective_gamma(&device.drm, *crtc, true) {
+                                warn!("error re-applying effective gamma: {err:?}");
                             }
                         } else if let Some(gamma_props) = &surface.gamma_props {
                             if let Err(err) = gamma_props.restore_gamma(&device.drm) {
@@ -1542,6 +1720,9 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             gamma_props,
+            base_vcgt_lut: None,
+            client_gamma: None,
+            loaded_icc_profile: None,
             pending_gamma_change: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -1552,6 +1733,14 @@ impl Tty {
 
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
+
+        let surface = device.surfaces.get_mut(&crtc).unwrap();
+        surface.update_icc_profile(
+            &device.drm,
+            crtc,
+            config.expanded_icc_profile().as_deref(),
+            self.session.is_active() && self.monitors_active,
+        );
 
         niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
 
@@ -1575,7 +1764,7 @@ impl Tty {
             return;
         };
 
-        let Some(surface) = device.surfaces.remove(&crtc) else {
+        let Some(mut surface) = device.surfaces.remove(&crtc) else {
             debug!("disconnecting connector for crtc: {crtc:?}");
 
             if let Some((conn, _)) = device
@@ -1597,6 +1786,14 @@ impl Tty {
 
             return;
         };
+
+        if let Some(mut gamma_props) = surface.gamma_props.take() {
+            if let Some(blob) = gamma_props.previous_blob.take() {
+                if let Err(err) = device.drm.destroy_property_blob(blob.get()) {
+                    warn!("error destroying GAMMA_LUT property blob on disconnect: {err:?}");
+                }
+            }
+        }
 
         debug!("disconnecting connector: {:?}", surface.name.connector);
 
@@ -1969,6 +2166,21 @@ impl Tty {
 
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
+                            if let Some(ramp) = surface.pending_gamma_change.take() {
+                                let ramp_slice = ramp.as_deref();
+                                let res = if let Some(gamma_props) = &mut surface.gamma_props {
+                                    gamma_props.set_gamma(&device.drm, ramp_slice)
+                                } else {
+                                    set_gamma_for_crtc(&device.drm, tty_state.crtc, ramp_slice)
+                                };
+                                if let Err(err) = res {
+                                    warn!("error applying pending gamma change after frame: {err:?}");
+                                    if is_transient_drm_error(&err) && surface.pending_gamma_change.is_none() {
+                                        surface.pending_gamma_change = Some(ramp);
+                                    }
+                                }
+                            }
+
                             let output_state = niri.output_state.get_mut(output).unwrap();
                             let new_state = RedrawState::WaitingForVBlank {
                                 redraw_needed: false,
@@ -2084,15 +2296,7 @@ impl Tty {
             .context("missing device")?;
 
         let surface = device.surfaces.get(&crtc).context("missing surface")?;
-        if let Some(gamma_props) = &surface.gamma_props {
-            gamma_props.gamma_size(&device.drm)
-        } else {
-            let info = device
-                .drm
-                .get_crtc(crtc)
-                .context("error getting crtc info")?;
-            Ok(info.gamma_length())
-        }
+        surface.get_gamma_size(&device.drm, crtc)
     }
 
     pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> anyhow::Result<()> {
@@ -2105,18 +2309,9 @@ impl Tty {
             .context("missing device")?;
         let surface = device.surfaces.get_mut(&crtc).context("missing surface")?;
 
-        // Cannot change properties while the device is inactive.
-        if !self.session.is_active() {
-            surface.pending_gamma_change = Some(ramp);
-            return Ok(());
-        }
-
-        let ramp = ramp.as_deref();
-        if let Some(gamma_props) = &mut surface.gamma_props {
-            gamma_props.set_gamma(&device.drm, ramp)
-        } else {
-            set_gamma_for_crtc(&device.drm, crtc, ramp)
-        }
+        surface.client_gamma = ramp;
+        let is_active = self.session.is_active() && self.monitors_active;
+        surface.apply_effective_gamma(&device.drm, crtc, is_active)
     }
 
     fn refresh_ipc_outputs(&self, niri: &mut Niri) {
@@ -2258,19 +2453,26 @@ impl Tty {
     }
 
     pub fn set_monitors_active(&mut self, active: bool) {
+        self.monitors_active = active;
+
         // We only disable the CRTC here, this will also reset the
         // surface state so that the next call to `render_frame` will
         // always produce a new frame and `queue_frame` will change
         // the CRTC to active. This makes sure we always enable a CRTC
         // within an atomic operation.
-        if active {
-            return;
-        }
-
-        for device in self.devices.values_mut() {
-            for surface in device.surfaces.values_mut() {
-                if let Err(err) = surface.compositor.clear() {
-                    warn!("error clearing drm surface: {err:?}");
+        if !active {
+            for device in self.devices.values_mut() {
+                for surface in device.surfaces.values_mut() {
+                    // Cache gamma while DPMS is off to restore it on wake.
+                    if surface.pending_gamma_change.is_none() {
+                        let effective = surface.compute_effective_gamma();
+                        if effective.is_some() {
+                            surface.pending_gamma_change = Some(effective);
+                        }
+                    }
+                    if let Err(err) = surface.compositor.clear() {
+                        warn!("error clearing drm surface: {err:?}");
+                    }
                 }
             }
         }
@@ -2451,6 +2653,13 @@ impl Tty {
                 } else {
                     warn!("failed to get connector properties");
                 }
+
+                surface.update_icc_profile(
+                    &device.drm,
+                    crtc,
+                    config.expanded_icc_profile().as_deref(),
+                    self.session.is_active() && self.monitors_active,
+                );
 
                 let change_mode = surface.compositor.pending_mode() != mode;
 
@@ -2688,8 +2897,8 @@ impl GammaProps {
             }
 
             let (red, rest) = gamma.split_at(gamma_size);
-            let (blue, green) = rest.split_at(gamma_size);
-            let mut data = zip(zip(red, blue), green)
+            let (green, blue) = rest.split_at(gamma_size);
+            let mut data = zip(zip(red, green), blue)
                 .map(|((&red, &green), &blue)| drm_color_lut {
                     red,
                     green,
@@ -3436,7 +3645,7 @@ pub fn set_gamma_for_crtc(
 
         let (red, rest) = temp.split_at_mut(gamma_length);
         let (green, blue) = rest.split_at_mut(gamma_length);
-        let denom = gamma_length as u64 - 1;
+        let denom = (gamma_length as u64 - 1).max(1);
         for (i, ((r, g), b)) in zip(zip(red, green), blue).enumerate() {
             let value = (0xFFFFu64 * i as u64 / denom) as u16;
             *r = value;
