@@ -3993,3 +3993,119 @@ fn interactive_move_cross_scaled_output_overlap() {
 
     check_ops(ops);
 }
+
+#[test]
+fn interactive_move_overview_view_rect() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::ToggleOverview,
+        Op::InteractiveMoveBegin {
+            window: 0,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveUpdate {
+            window: 0,
+            dx: 50.,
+            dy: 50.,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveEnd { window: 0 },
+    ];
+
+    check_ops(ops);
+}
+
+#[test]
+fn interactive_move_view_rect_is_workspace_relative_in_overview() {
+    // Build a layout with one output and one window.
+    let mut layout = Layout::default();
+    let ops_setup = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+    ];
+    check_ops_on_layout(&mut layout, ops_setup);
+    let output = layout.outputs().next().unwrap().clone();
+
+    // INTERACTIVE_MOVE_START_THRESHOLD is 256² = 65536, so we need delta > 256
+    // to make the state transition from Starting → Moving.
+    let big_delta = 300.;
+
+    // Drag without overview first.
+    let ops_no_overview = [
+        Op::InteractiveMoveBegin {
+            window: 0,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveUpdate {
+            window: 0,
+            dx: big_delta,
+            dy: 0.,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+    ];
+    check_ops_on_layout(&mut layout, ops_no_overview);
+    layout.update_render_elements(None);
+    let view_rect_no_overview = layout.interactive_move_view_rect(&output);
+    assert!(
+        view_rect_no_overview.is_some(),
+        "should have a view_rect during interactive move (no overview)"
+    );
+
+    check_ops_on_layout(&mut layout, [Op::InteractiveMoveEnd { window: 0 }]);
+
+    // Open overview, then drag the same window.
+    check_ops_on_layout(&mut layout, [Op::ToggleOverview]);
+    let ops_overview = [
+        Op::InteractiveMoveBegin {
+            window: 0,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveUpdate {
+            window: 0,
+            dx: big_delta,
+            dy: 0.,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+    ];
+    check_ops_on_layout(&mut layout, ops_overview);
+    layout.update_render_elements(None);
+    let view_rect_overview = layout.interactive_move_view_rect(&output);
+    assert!(
+        view_rect_overview.is_some(),
+        "should have a view_rect during interactive move in overview"
+    );
+
+    // Both rects must have positive dimensions.
+    let r = view_rect_overview.unwrap();
+    assert!(
+        r.size.w > 0. && r.size.h > 0.,
+        "overview view_rect must have positive size, got {r:?}"
+    );
+
+    // In overview ws_offset is non-zero (workspace not at output origin due to zoom/centering),
+    // so the overview rect must differ from the non-overview rect.
+    assert_ne!(
+        view_rect_no_overview.unwrap(),
+        r,
+        "overview view_rect should be workspace-relative, not identical to non-overview rect"
+    );
+
+    check_ops_on_layout(&mut layout, [Op::InteractiveMoveEnd { window: 0 }]);
+}

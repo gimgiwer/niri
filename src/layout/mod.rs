@@ -452,6 +452,11 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
+    /// Last workspace identified under the drag pointer in overview mode.
+    ///
+    /// Sticky: kept across gaps between workspaces so blur doesn't jump when
+    /// the pointer briefly lands in empty space between two workspaces.
+    pub(self) sampling_workspace: Option<WorkspaceId>,
 }
 
 #[derive(Debug)]
@@ -2805,26 +2810,50 @@ impl<W: LayoutElement> Layout<W> {
         self.update_render_elements_time = self.clock.now();
 
         let zoom = self.overview_zoom();
+        let is_overview = self.overview_open || self.overview_progress.is_some();
+
         let is_overlapping =
             output.is_none_or(|output| self.interactive_move_rect_on_output(output).is_some());
 
-        if is_overlapping {
-            if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
-                let target_output = output.unwrap_or(&move_.output);
-                let pos_within_output = move_.tile_render_location_for_output(target_output, zoom);
+        let moving_info = if is_overlapping {
+            if let Some(InteractiveMoveState::Moving(m)) = &self.interactive_move {
+                let target_output = output.unwrap_or(&m.output);
+                let pos_within_output = m.tile_render_location_for_output(target_output, zoom);
+                Some((
+                    target_output.clone(),
+                    m.pointer_pos_within_output,
+                    pos_within_output,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-                // We're not on any specific workspace so we can't compute a "workspace view" rect.
-                // Let's instead compute a rect relative to the output.
-                //
-                // FIXME: we could make the colors match up better in the overview by figuring out
-                // where a centered workspace would currently be, and computing the view rect
-                // against that. Since most of the time the dragged window will be on a centered
-                // workspace.
-                let view_rect =
-                    Rectangle::new(pos_within_output.upscale(-1.), output_size(target_output))
-                        .downscale(zoom);
+        if let Some((move_output, pointer_pos, pos_within_output)) = moving_info {
+            if let Some(mon) = self.monitor_for_output(&move_output) {
+                // Read current sticky workspace (immutable, before mutable borrow).
+                let prev_sampling = match &self.interactive_move {
+                    Some(InteractiveMoveState::Moving(m)) => m.sampling_workspace,
+                    _ => None,
+                };
 
-                move_.tile.update_render_elements(true, view_rect);
+                let (ws_offset, new_sampling) =
+                    ws_offset_for_drag(mon, pointer_pos, is_overview, prev_sampling);
+
+                let view_rect = Rectangle::new(
+                    (pos_within_output - ws_offset).upscale(-1.),
+                    output_size(&move_output),
+                )
+                .downscale(zoom);
+
+                if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+                    if move_.output == move_output {
+                        move_.sampling_workspace = new_sampling;
+                        move_.tile.update_render_elements(true, view_rect);
+                    }
+                }
             }
         }
 
@@ -2851,6 +2880,41 @@ impl<W: LayoutElement> Layout<W> {
                 mon.update_render_elements(is_active);
             }
         }
+    }
+
+    /// Compute the `view_rect` for the currently dragged tile on `output`.
+    /// Returns `None` if there is no active drag on that output.
+    #[cfg(test)]
+    pub fn interactive_move_view_rect(
+        &self,
+        output: &Output,
+    ) -> Option<Rectangle<f64, smithay::utils::Logical>> {
+        let zoom = self.overview_zoom();
+        let is_overview = self.overview_open || self.overview_progress.is_some();
+
+        let m = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(m)) if m.output == *output => m,
+            _ => return None,
+        };
+
+        let pos_within_output = m.tile_render_location(zoom);
+        let mon = self.monitor_for_output(output)?;
+
+        let ws_offset = ws_offset_for_drag(
+            mon,
+            m.pointer_pos_within_output,
+            is_overview,
+            m.sampling_workspace,
+        )
+        .0; // read-only: ignore the updated sampling id
+
+        Some(
+            Rectangle::new(
+                (pos_within_output - ws_offset).upscale(-1.),
+                output_size(output),
+            )
+            .downscale(zoom),
+        )
     }
 
     pub fn update_shaders(&mut self) {
@@ -4048,6 +4112,7 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
+                    sampling_workspace: None,
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -5072,4 +5137,39 @@ fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f
     } else {
         1.
     }
+}
+/// Return `(ws_offset, updated_sampling_id)` for blur/backdrop sampling during an interactive move.
+///
+/// In overview the backdrop shader samples from a per-workspace texture, so the view rect must
+/// be relative to where that workspace currently sits on the output, not the output origin.
+///
+/// `prev_sampling` is the sticky last-known workspace id: kept across gaps between workspaces
+/// so blur coordinates don't jump when the pointer is briefly in empty space.
+fn ws_offset_for_drag<W: LayoutElement>(
+    mon: &Monitor<W>,
+    pointer_pos: Point<f64, Logical>,
+    is_overview: bool,
+    prev_sampling: Option<WorkspaceId>,
+) -> (Point<f64, Logical>, Option<WorkspaceId>) {
+    if !is_overview {
+        return (Point::default(), None);
+    }
+
+    // Update the sticky workspace when the pointer is directly over one.
+    if let Some((ws, geo)) = mon.workspace_under(pointer_pos) {
+        return (geo.loc, Some(ws.id()));
+    }
+
+    // Pointer is in a gap — keep last known workspace geometry so blur stays stable.
+    if let Some(id) = prev_sampling {
+        // workspaces_with_render_geo returns only visible workspaces; that's fine for a fallback.
+        let geo = mon
+            .workspaces_with_render_geo()
+            .find_map(|(ws, geo)| (ws.id() == id).then_some(geo));
+        if let Some(geo) = geo {
+            return (geo.loc, Some(id));
+        }
+    }
+
+    (Point::default(), None)
 }

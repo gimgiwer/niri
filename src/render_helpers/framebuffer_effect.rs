@@ -227,7 +227,9 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             } else {
                 trace!("creating framebuffer texture sized {} × {}", size.w, size.h);
                 let renderer = guard.as_mut();
-                let texture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+                let texture = renderer
+                    .create_buffer(Fourcc::Abgr2101010, size)
+                    .or_else(|_| renderer.create_buffer(Fourcc::Abgr8888, size))?;
                 inner.framebuffer.insert(texture)
             };
 

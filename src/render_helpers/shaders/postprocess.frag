@@ -16,9 +16,15 @@ vec3 saturate(vec3 color, float sat) {
 }
 
 vec4 postprocess(vec4 color) {
-    if (saturation != 1.0) {
+    // Epsilon check skips saturation math when effectively identity to save ALU ops.
+    if (abs(saturation - 1.0) > 0.001) {
         color.rgb = saturate(color.rgb, saturation);
     }
+
+    // S-curve pivots at 0.45 to restore depth on blurred backgrounds without crushing shadows.
+    const float contrast = 1.12;
+    const float midpoint = 0.45;
+    color.rgb = clamp((color.rgb - vec3(midpoint)) * contrast + vec3(midpoint), 0.0, 1.0);
 
     if (noise > 0.0) {
         vec2 uv = gl_FragCoord.xy;

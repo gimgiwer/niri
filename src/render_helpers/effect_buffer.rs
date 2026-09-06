@@ -196,8 +196,10 @@ impl EffectBuffer {
             let span = tracy_client::span!("creating effect offscreen texture");
             span.emit_text(reason);
 
+            // Prefer 10-bit intermediates; 8-bit quantization banding accumulates visibly across multiple blur passes.
             let texture: GlesTexture = renderer
-                .create_buffer(Fourcc::Abgr8888, self.size)
+                .create_buffer(Fourcc::Abgr2101010, self.size)
+                .or_else(|_| renderer.create_buffer(Fourcc::Abgr8888, self.size))
                 .context("error creating texture")?;
 
             let buffer_size = self.size.to_logical(1, Transform::Normal).to_physical(1);

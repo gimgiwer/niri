@@ -22,10 +22,21 @@ pub struct Blur {
     textures: Vec<GlesTexture>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlurOptions {
     pub passes: u8,
     pub offset: f64,
+    pub zoom: f64,
+}
+
+impl Default for BlurOptions {
+    fn default() -> Self {
+        Self {
+            passes: 0,
+            offset: 0.0,
+            zoom: 1.0,
+        }
+    }
 }
 
 impl From<niri_config::Blur> for BlurOptions {
@@ -33,7 +44,14 @@ impl From<niri_config::Blur> for BlurOptions {
         Self {
             passes: config.passes,
             offset: config.offset,
+            zoom: 1.0,
         }
+    }
+}
+
+impl BlurOptions {
+    pub fn effective_offset(&self) -> f32 {
+        (self.offset * self.zoom).max(0.0) as f32
     }
 }
 
@@ -152,8 +170,10 @@ impl Blur {
 
             // debug!("creating texture for step {i} sized {w} × {h}");
 
-            let texture: GlesTexture =
-                create_texture(Fourcc::Abgr8888, size).context("error creating texture")?;
+            // Prefer 10-bit intermediates; 8-bit quantization banding accumulates visibly across multiple blur passes.
+            let texture: GlesTexture = create_texture(Fourcc::Abgr2101010, size)
+                .or_else(|_| create_texture(Fourcc::Abgr8888, size))
+                .context("error creating texture")?;
             self.textures.push(texture);
         }
 
@@ -214,7 +234,7 @@ impl Blur {
             let program = &self.program.0.down;
             gl.UseProgram(program.program);
             gl.Uniform1i(program.uniform_tex, 0);
-            gl.Uniform1f(program.uniform_offset, options.offset as f32);
+            gl.Uniform1f(program.uniform_offset, options.effective_offset());
 
             let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
             gl.EnableVertexAttribArray(program.attrib_vert as u32);
@@ -274,7 +294,7 @@ impl Blur {
             let program = &self.program.0.up;
             gl.UseProgram(program.program);
             gl.Uniform1i(program.uniform_tex, 0);
-            gl.Uniform1f(program.uniform_offset, options.offset as f32);
+            gl.Uniform1f(program.uniform_offset, options.effective_offset());
 
             let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
             gl.EnableVertexAttribArray(program.attrib_vert as u32);

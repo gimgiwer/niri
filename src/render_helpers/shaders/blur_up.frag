@@ -13,6 +13,9 @@ void main() {
 
     vec4 sum = vec4(0.0);
 
+    // Dual Kawase 9-tap: center weight 4 preserves signal energy, preventing dark halos during reconstruction.
+    sum += texture2D(tex, v_coords) * 4.0;
+
     // Four edge centers
     sum += texture2D(tex, v_coords + vec2(-o.x * 2.0, 0.0));
     sum += texture2D(tex, v_coords + vec2( o.x * 2.0, 0.0));
@@ -25,5 +28,5 @@ void main() {
     sum += texture2D(tex, v_coords + vec2(-o.x, -o.y)) * 2.0;
     sum += texture2D(tex, v_coords + vec2( o.x, -o.y)) * 2.0;
 
-    gl_FragColor = sum / 12.0;
+    gl_FragColor = sum / 16.0;
 }
