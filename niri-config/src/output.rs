@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use knuffel::ast::SpannedNode;
@@ -78,6 +79,25 @@ pub struct Output {
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child, unwrap(argument))]
+    pub icc_profile: Option<PathBuf>,
+}
+
+pub type OutputConfig = Output;
+
+/// Expand ~ to user home dir.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if path_str == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    path.to_path_buf()
 }
 
 impl Output {
@@ -91,6 +111,10 @@ impl Output {
 
     pub fn is_vrr_always_off(&self) -> bool {
         self.variable_refresh_rate.is_none()
+    }
+
+    pub fn expanded_icc_profile(&self) -> Option<PathBuf> {
+        self.icc_profile.as_ref().map(|p| expand_tilde(p))
     }
 }
 
@@ -111,6 +135,7 @@ impl Default for Output {
             backdrop_color: None,
             hot_corners: None,
             layout: None,
+            icc_profile: None,
         }
     }
 }
@@ -684,5 +709,24 @@ mod tests {
         ]
         "#
         );
+    }
+
+    #[test]
+    fn test_parse_output_icc_profile() {
+        let kdl = r#"
+            output "eDP-1" {
+                icc-profile "~/profiles/custom.icc"
+            }
+        "#;
+        let outputs: Vec<Output> = knuffel::parse("test", kdl).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].icc_profile,
+            Some(PathBuf::from("~/profiles/custom.icc"))
+        );
+        let expanded = outputs[0].expanded_icc_profile().unwrap();
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(expanded, PathBuf::from(home).join("profiles/custom.icc"));
+        }
     }
 }
