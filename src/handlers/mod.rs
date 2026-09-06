@@ -704,29 +704,40 @@ impl DrmLeaseHandler for State {
             "Received lease request for {} connectors",
             request.connectors.len()
         );
-        self.backend
+        if let Err(err) = self
+            .backend
             .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .lease_request(request)
+            .ensure_secondary_gpu_initialized(node, &mut self.niri)
+        {
+            warn!("failed to ensure secondary GPU initialized for lease request on {node:?}: {err:?}");
+        }
+        let Some(device) = self.backend.tty().get_device_from_node(node) else {
+            warn!("lease requested for unknown DRM device {node:?}");
+            return Err(LeaseRejected::default());
+        };
+        device.lease_request(request)
     }
 
     fn new_active_lease(&mut self, node: DrmNode, lease: DrmLease) {
         debug!("Lease success");
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .new_lease(lease);
+        let Some(device) = self.backend.tty().get_device_from_node(node) else {
+            warn!("new active lease on unknown DRM device {node:?}");
+            return;
+        };
+        device.new_lease(lease);
     }
 
     fn lease_destroyed(&mut self, node: DrmNode, lease_id: u32) {
         debug!("Destroyed lease");
+        let Some(device) = self.backend.tty().get_device_from_node(node) else {
+            warn!("lease destroyed for unknown DRM device {node:?}");
+            return;
+        };
+        device.remove_lease(lease_id);
+        // Check if the GPU can now be suspended.
         self.backend
             .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .remove_lease(lease_id);
+            .check_suspend_device(&mut self.niri, node);
     }
 }
 
