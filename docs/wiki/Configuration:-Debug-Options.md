@@ -35,6 +35,7 @@ debug {
     skip-cursor-only-updates-during-vrr
     deactivate-unfocused-windows
     disable-10bit-output
+    disable-idle-drm-device-suspend
 }
 
 binds {
@@ -358,6 +359,24 @@ debug {
 }
 ```
 
+### `disable-idle-drm-device-suspend`
+
+<sup>Since: next release</sup>
+
+Disable automatic suspend of idle secondary GPUs.
+
+By default, niri suspends secondary GPUs (dGPUs, eGPUs) that aren't driving any outputs or leases.
+This saves power and allows the device to reach ACPI `D3cold` on supported hardware.
+
+Use this flag if suspend causes issues with hotplug, wakeup, or rendering.
+
+See [GPUs](./GPUs.md#power-management) for more details.
+
+```kdl
+debug {
+    disable-idle-drm-device-suspend
+}
+```
 ### Key Bindings
 
 These are not debug options, but rather key bindings.
