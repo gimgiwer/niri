@@ -4,8 +4,10 @@ use std::fmt::Write;
 use std::iter::zip;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, mem};
@@ -78,6 +80,104 @@ const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
 // Smithay should fall back to Xrgb/Xbgr automatically if needed.
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemPmState {
+    Running,
+    Quiescing,
+    Suspended,
+    ResumePending,
+}
+
+#[derive(Clone)]
+struct GpuGate {
+    open_allowed: Arc<AtomicBool>,
+    pm_generation: Arc<AtomicU64>,
+    active_access_guards: Arc<AtomicUsize>,
+}
+
+struct GpuAccessGuard(Arc<AtomicUsize>);
+
+impl Drop for GpuAccessGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl GpuGate {
+    fn new() -> Self {
+        Self {
+            open_allowed: Arc::new(AtomicBool::new(true)),
+            pm_generation: Arc::new(AtomicU64::new(0)),
+            active_access_guards: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn acquire_guard(&self, expected_generation: u64) -> Option<GpuAccessGuard> {
+        self.active_access_guards.fetch_add(1, Ordering::SeqCst);
+        if !self.open_allowed.load(Ordering::SeqCst)
+            || self.pm_generation.load(Ordering::SeqCst) != expected_generation
+        {
+            self.active_access_guards.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(GpuAccessGuard(self.active_access_guards.clone()))
+    }
+}
+
+#[derive(Debug)]
+enum WakeupState {
+    Pending,
+    Woken {
+        #[allow(dead_code)]
+        file: std::fs::File,
+        generation: u64,
+    },
+    WokenNoFd {
+        generation: u64,
+    },
+    Failed,
+    Cancelled,
+}
+
+struct PendingDeviceInit {
+    attempts: usize,
+    generation: u64,
+    timer_token: Option<RegistrationToken>,
+    wakeup_state: Arc<Mutex<WakeupState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerState {
+    Active,
+    Suspended,
+    WakingUp { generation: u64 },
+    Failed,
+}
+
+struct GpuPowerState {
+    state: PowerState,
+    wakeup_generation: u64,
+    resume_attempts: usize,
+    wakeup_state: Arc<Mutex<WakeupState>>,
+    suspend_timer: Option<RegistrationToken>,
+    wakeup_timer: Option<RegistrationToken>,
+    disable_suspend_due_to_nvidia_vram: bool,
+}
+
+impl GpuPowerState {
+    fn new(disable_suspend_due_to_nvidia_vram: bool) -> Self {
+        Self {
+            state: PowerState::Active,
+            wakeup_generation: 0,
+            resume_attempts: 0,
+            wakeup_state: Arc::new(Mutex::new(WakeupState::Pending)),
+            suspend_timer: None,
+            wakeup_timer: None,
+            disable_suspend_due_to_nvidia_vram,
+        }
+    }
+}
+
 pub struct Tty {
     config: Rc<RefCell<Config>>,
     session: LibSeatSession,
@@ -93,6 +193,13 @@ pub struct Tty {
     ignored_nodes: HashSet<DrmNode>,
     // Devices indexed by DRM node (not necessarily the render node).
     devices: HashMap<DrmNode, OutputDevice>,
+    pending_device_inits: HashMap<DrmNode, PendingDeviceInit>,
+    next_pending_init_generation: u64,
+    gpu_power: HashMap<DrmNode, GpuPowerState>,
+    system_pm: SystemPmState,
+    gpu_gate: GpuGate,
+    quiesce_timer: Option<RegistrationToken>,
+    inhibitor_fd: Option<OwnedFd>,
     // The dma-buf global corresponds to the output device (the primary GPU). It is only `Some()`
     // if we have a device corresponding to the primary GPU.
     dmabuf_global: Option<DmabufGlobal>,
@@ -341,20 +448,27 @@ impl OutputDevice {
             req.add_property(plane, fb_id, property::Value::Framebuffer(None));
         }
 
-        // Disable the CRTCs.
+        // Disable the CRTCs and clear property blobs.
         for crtc in cleanup {
-            let Some((mode_id, _, _)) = find_drm_property(&self.drm, crtc, "MODE_ID") else {
-                debug!("couldn't find CRTC MODE_ID property");
-                continue;
-            };
+            if let Some((mode_id, _, _)) = find_drm_property(&self.drm, crtc, "MODE_ID") {
+                req.add_property(crtc, mode_id, property::Value::Unknown(0));
+            }
 
-            let Some((active, _, _)) = find_drm_property(&self.drm, crtc, "ACTIVE") else {
-                debug!("couldn't find CRTC ACTIVE property");
-                continue;
-            };
+            if let Some((active, _, _)) = find_drm_property(&self.drm, crtc, "ACTIVE") {
+                req.add_property(crtc, active, property::Value::Boolean(false));
+            }
 
-            req.add_property(crtc, mode_id, property::Value::Unknown(0));
-            req.add_property(crtc, active, property::Value::Boolean(false));
+            if let Some((gamma_lut, _, _)) = find_drm_property(&self.drm, crtc, "GAMMA_LUT") {
+                req.add_property(crtc, gamma_lut, property::Value::Unknown(0));
+            }
+
+            if let Some((degamma_lut, _, _)) = find_drm_property(&self.drm, crtc, "DEGAMMA_LUT") {
+                req.add_property(crtc, degamma_lut, property::Value::Unknown(0));
+            }
+
+            if let Some((ctm, _, _)) = find_drm_property(&self.drm, crtc, "CTM") {
+                req.add_property(crtc, ctm, property::Value::Unknown(0));
+            }
         }
 
         self.drm
@@ -431,7 +545,612 @@ struct ConnectorProperties<'a> {
     requests: AtomicModeReq,
 }
 
+// PRIME render offload clients (DRI3/Vulkan) open the render node directly and wake
+// the GPU on their own, so we don't need to keep it awake here.
+fn is_device_idle_and_last(tty: &Tty, node: DrmNode) -> bool {
+    let Some(device) = tty.devices.get(&node) else {
+        return false;
+    };
+    let key = tty.gpu_power_key(node);
+    let Some(power) = tty.gpu_power.get(&key) else {
+        return false;
+    };
+
+    if tty.config.borrow().debug.disable_idle_drm_device_suspend
+        || power.disable_suspend_due_to_nvidia_vram
+        || !device.surfaces.is_empty()
+        || !device.active_leases.is_empty()
+        || !device.non_desktop_connectors.is_empty()
+    {
+        return false;
+    }
+
+    !tty.devices.iter().any(|(other_node, other)| {
+        let other_is_suspended = tty
+            .gpu_power
+            .get(&tty.gpu_power_key(*other_node))
+            .map(|power| power.state == PowerState::Suspended)
+            .unwrap_or(false);
+
+        *other_node != node
+            && tty.gpu_power_key(*other_node) == key
+            && !other_is_suspended
+            && (!other.surfaces.is_empty()
+                || !other.active_leases.is_empty()
+                || !other.non_desktop_connectors.is_empty())
+    })
+}
+
+// On NVIDIA, suspend requires NVreg_PreserveVideoMemoryAllocations=1, otherwise VRAM gets
+// trashed across suspend/resume.
+fn check_nvidia_preserve_memory(node: DrmNode) -> Option<bool> {
+    let path = node.dev_path()?;
+    let dev_name = path.file_name()?.to_str()?;
+    let sys_path = format!("/sys/class/drm/{dev_name}/device/driver");
+    let driver_path = std::fs::read_link(sys_path).ok()?;
+    if driver_path.file_name()? != "nvidia" {
+        return None;
+    }
+
+    if let Ok(content) =
+        std::fs::read_to_string("/sys/module/nvidia/parameters/PreserveVideoMemoryAllocations")
+    {
+        return Some(matches!(content.trim(), "Y" | "1"));
+    }
+
+    if let Ok(content) = std::fs::read_to_string("/proc/driver/nvidia/params") {
+        let val = content
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim() == "PreserveVideoMemoryAllocations")
+            .map(|(_, value)| value.trim() == "1")
+            .unwrap_or(false);
+        return Some(val);
+    }
+
+    Some(false)
+}
+
+fn return_device_fd(session: &mut LibSeatSession, device_fd: DrmDeviceFd, raw_device_fd: DeviceFd) {
+    drop(device_fd);
+    match TryInto::<OwnedFd>::try_into(raw_device_fd) {
+        Ok(fd) => {
+            if let Err(err) = session.close(fd) {
+                warn!("error closing DRM device fd: {err:?}");
+            }
+        }
+        Err(_) => warn!("could not close DRM device fd: unexpected Arc references"),
+    }
+}
+
+fn spawn_gpu_wakeup_thread(
+    render_path: std::path::PathBuf,
+    expected_dev_id: u64,
+    generation: u64,
+    pm_generation: u64,
+    gpu_gate: GpuGate,
+    wakeup_state: Arc<Mutex<WakeupState>>,
+) {
+    std::thread::spawn(move || {
+        for _ in 0..WAKEUP_ATTEMPTS {
+            {
+                let lock = wakeup_state.lock().unwrap();
+                if let WakeupState::Cancelled = *lock {
+                    return;
+                }
+            }
+
+            let file_opt = {
+                let Some(_guard) = gpu_gate.acquire_guard(pm_generation) else {
+                    debug!(
+                        "gpu open not allowed or stale generation for {render_path:?}, cancelling wakeup"
+                    );
+                    let mut lock = wakeup_state.lock().unwrap();
+                    if let WakeupState::Pending = *lock {
+                        *lock = WakeupState::Cancelled;
+                    }
+                    return;
+                };
+                std::fs::OpenOptions::new().read(true).open(&render_path)
+            };
+
+            if let Ok(file) = file_opt {
+                match file.metadata() {
+                    Ok(meta) => {
+                        if meta.rdev() == expected_dev_id {
+                            let mut lock = wakeup_state.lock().unwrap();
+                            if let WakeupState::Pending = *lock {
+                                *lock = WakeupState::Woken { file, generation };
+                            }
+                            return;
+                        } else {
+                            let mut lock = wakeup_state.lock().unwrap();
+                            if let WakeupState::Pending = *lock {
+                                *lock = WakeupState::Failed;
+                            }
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("failed to read metadata for {render_path:?}: {err:?}");
+                    }
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(WAKEUP_DELAY_MS));
+        }
+
+        let mut lock = wakeup_state.lock().unwrap();
+        if let WakeupState::Pending = *lock {
+            warn!(
+                "failed to open GPU render node at {render_path:?} for wakeup after \
+                 {WAKEUP_ATTEMPTS} attempts"
+            );
+            *lock = WakeupState::Failed;
+        }
+    });
+}
+
+const SUSPEND_TIMEOUT_SECS: u64 = 10;
+const WAKEUP_ATTEMPTS: usize = 40;
+const WAKEUP_DELAY_MS: u64 = 250;
+
+fn wakeup_retry_delay() -> std::time::Duration {
+    std::time::Duration::from_millis(WAKEUP_DELAY_MS)
+}
+
 impl Tty {
+    pub(crate) fn update_dmabuf_feedbacks(&mut self, niri: &mut Niri) {
+        if let Ok(primary_renderer) = self.gpu_manager.single_renderer(&self.primary_render_node) {
+            let primary_formats = primary_renderer.dmabuf_formats();
+
+            if let Some(dmabuf_global) = self.dmabuf_global.as_mut() {
+                if let Ok(default_feedback) = DmabufFeedbackBuilder::new(
+                    self.primary_render_node.dev_id(),
+                    primary_formats.clone(),
+                )
+                .build()
+                {
+                    niri.dmabuf_state
+                        .set_default_feedback(dmabuf_global, &default_feedback);
+                }
+            }
+
+            for (node, device) in self.devices.iter_mut() {
+                for surface in device.surfaces.values_mut() {
+                    match surface_dmabuf_feedback(
+                        &surface.compositor,
+                        primary_formats.clone(),
+                        self.primary_render_node,
+                        device.render_node,
+                        *node,
+                    ) {
+                        Ok(feedback) => {
+                            surface.dmabuf_feedback = Some(feedback);
+                        }
+                        Err(err) => warn!("error building dmabuf feedback: {err:?}"),
+                    }
+                }
+            }
+
+            niri.queue_redraw_all();
+        }
+    }
+
+    fn gpu_power_key(&self, node: DrmNode) -> DrmNode {
+        if let Some(device) = self.devices.get(&node) {
+            return device.render_node.unwrap_or(node);
+        }
+        if node != self.primary_node {
+            return node;
+        }
+        if node.ty() == NodeType::Render {
+            node
+        } else {
+            node.node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .unwrap_or(node)
+        }
+    }
+
+    fn find_active_primary_for_key(&self, key: DrmNode) -> Option<DrmNode> {
+        self.devices.iter().find_map(|(node, device)| {
+            if device.render_node == Some(key) || (device.render_node.is_none() && *node == key) {
+                Some(*node)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn sync_gpu_manager_devices(&mut self) {
+        // Smithay may keep old Arc refs around until devices() runs.
+        let _ = self.gpu_manager.devices();
+    }
+
+    fn prime_gpu_power_state(&mut self, node: DrmNode, render_node: Option<DrmNode>) {
+        let key = render_node.unwrap_or(node);
+        if self.gpu_power.contains_key(&key) {
+            return;
+        }
+
+        let disable_suspend_due_to_nvidia_vram =
+            node != self.primary_node && check_nvidia_preserve_memory(node) == Some(false);
+
+        if disable_suspend_due_to_nvidia_vram {
+            warn!(
+                "nvidia gpu {node:?}: PreserveVideoMemoryAllocations off or unreadable, not suspending; \
+                 boot with nvidia.NVreg_PreserveVideoMemoryAllocations=1 to fix"
+            );
+        }
+
+        self.gpu_power
+            .insert(key, GpuPowerState::new(disable_suspend_due_to_nvidia_vram));
+    }
+}
+
+fn should_start_gpu_wakeup(power: &GpuPowerState, is_retry: bool) -> bool {
+    match power.state {
+        PowerState::Active | PowerState::Suspended => true,
+        PowerState::WakingUp { .. } | PowerState::Failed => is_retry,
+    }
+}
+
+fn migrate_gpu_power_state_map(
+    gpu_power: &mut HashMap<DrmNode, GpuPowerState>,
+    early_key: DrmNode,
+    actual_key: DrmNode,
+) -> Vec<RegistrationToken> {
+    let mut tokens_to_cancel = Vec::new();
+    if early_key != actual_key {
+        if let Some(power) = gpu_power.get_mut(&early_key) {
+            if let Some(token) = power.suspend_timer.take() {
+                tokens_to_cancel.push(token);
+            }
+            if let Some(token) = power.wakeup_timer.take() {
+                tokens_to_cancel.push(token);
+            }
+        }
+
+        if gpu_power.contains_key(&actual_key) {
+            if let Some(power) = gpu_power.remove(&early_key) {
+                *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+            }
+        } else if let Some(power) = gpu_power.remove(&early_key) {
+            gpu_power.insert(actual_key, power);
+            debug!(
+                "migrated GPU power state from early key {early_key:?} to actual key {actual_key:?}"
+            );
+        }
+    }
+    tokens_to_cancel
+}
+
+impl Tty {
+    fn migrate_and_prepare_gpu_power_state(
+        &mut self,
+        niri: &mut Niri,
+        node: DrmNode,
+        render_node: Option<DrmNode>,
+    ) -> &mut GpuPowerState {
+        let early_key = if node == self.primary_node {
+            node.node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .unwrap_or(node)
+        } else {
+            node
+        };
+        let actual_key = render_node.unwrap_or(node);
+
+        let tokens = migrate_gpu_power_state_map(&mut self.gpu_power, early_key, actual_key);
+        for token in tokens {
+            niri.event_loop.remove(token);
+        }
+
+        self.prime_gpu_power_state(node, render_node);
+        self.cancel_gpu_power_timer_by_key(niri, actual_key);
+        let power = self
+            .gpu_power
+            .entry(actual_key)
+            .or_insert_with(|| GpuPowerState::new(false));
+        power.disable_suspend_due_to_nvidia_vram =
+            node != self.primary_node && check_nvidia_preserve_memory(node) == Some(false);
+        *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+        power.state = PowerState::Active;
+        power.resume_attempts = 0;
+        power
+    }
+
+    fn gpu_power_state_mut(&mut self, node: DrmNode) -> &mut GpuPowerState {
+        let key = self.gpu_power_key(node);
+        if !self.gpu_power.contains_key(&key) {
+            let render_node = if node == self.primary_node {
+                if node.ty() == NodeType::Render {
+                    Some(node)
+                } else {
+                    node.node_with_type(NodeType::Render).and_then(Result::ok)
+                }
+            } else {
+                None
+            };
+            self.prime_gpu_power_state(node, render_node);
+        }
+        self.gpu_power
+            .get_mut(&key)
+            .expect("gpu_power state must exist after priming")
+    }
+
+    fn cancel_gpu_power_timer_by_key(&mut self, niri: &mut Niri, key: DrmNode) {
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            if let Some(token) = power.suspend_timer.take() {
+                niri.event_loop.remove(token);
+            }
+
+            if let Some(token) = power.wakeup_timer.take() {
+                niri.event_loop.remove(token);
+            }
+        }
+    }
+
+    fn reset_wakeup_state_by_key(&mut self, niri: &mut Niri, key: DrmNode, failed: bool) {
+        self.cancel_gpu_power_timer_by_key(niri, key);
+
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            power.state = if failed {
+                PowerState::Failed
+            } else {
+                PowerState::Suspended
+            };
+            power.resume_attempts = 0;
+            *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+        }
+    }
+
+    fn reset_wakeup_state(&mut self, niri: &mut Niri, node: DrmNode) {
+        let key = self.gpu_power_key(node);
+        self.reset_wakeup_state_by_key(niri, key, false);
+    }
+
+    fn remove_pending_device_init(&mut self, niri: &mut Niri, node: &DrmNode) {
+        if let Some(pending) = self.pending_device_inits.remove(node) {
+            *pending.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+            if let Some(token) = pending.timer_token {
+                niri.event_loop.remove(token);
+            }
+        }
+    }
+
+    fn start_gpu_wakeup(&mut self, niri: &mut Niri, node: DrmNode) -> Result<(), ()> {
+        if !self.gpu_access_allowed() {
+            return Err(());
+        }
+
+        let render_node = self
+            .devices
+            .get(&node)
+            .and_then(|device| device.render_node)
+            .or_else(|| node.node_with_type(NodeType::Render).and_then(Result::ok));
+        let render_target =
+            render_node.and_then(|rn| rn.dev_path().map(|path| (path, rn.dev_id())));
+
+        let key = self.gpu_power_key(node);
+        self.cancel_gpu_power_timer_by_key(niri, key);
+
+        let wakeup_state = Arc::new(Mutex::new(WakeupState::Pending));
+        let generation = {
+            let power = self.gpu_power_state_mut(node);
+            power.wakeup_generation = power.wakeup_generation.wrapping_add(1).max(1);
+            *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+
+            power.wakeup_state = wakeup_state.clone();
+            let gen = power.wakeup_generation;
+            power.state = PowerState::WakingUp { generation: gen };
+            power.resume_attempts = 1;
+
+            gen
+        };
+
+        if let Some((render_path, expected_dev_id)) = render_target {
+            debug!("waking GPU {node:?} in background thread");
+            spawn_gpu_wakeup_thread(
+                render_path,
+                expected_dev_id,
+                generation,
+                self.gpu_gate.pm_generation.load(Ordering::SeqCst),
+                self.gpu_gate.clone(),
+                wakeup_state,
+            );
+        } else {
+            *wakeup_state.lock().unwrap() = WakeupState::WokenNoFd { generation };
+        }
+
+        if self.schedule_wakeup_retry(niri, key).is_err() {
+            self.reset_wakeup_state(niri, node);
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn schedule_wakeup_retry(&mut self, niri: &mut Niri, key: DrmNode) -> Result<(), ()> {
+        let token = niri
+            .event_loop
+            .insert_source(
+                Timer::from_duration(wakeup_retry_delay()),
+                move |_, _, state| {
+                    if let Some(tty) = state.backend.tty_checked() {
+                        tty.check_async_device_resume(key, &mut state.niri);
+                    }
+
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|err| {
+                error!("couldn't set wakeup check timer for GPU {key:?}: {err:?}");
+            })?;
+
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            if let Some(old_token) = power.wakeup_timer.take() {
+                niri.event_loop.remove(old_token);
+            }
+            power.wakeup_timer = Some(token);
+        }
+
+        Ok(())
+    }
+
+    fn check_async_device_init(&mut self, device_id: dev_t, path: &Path, niri: &mut Niri) {
+        if !self.session.is_active() {
+            let Ok(node) = DrmNode::from_dev_id(device_id) else {
+                return;
+            };
+            self.remove_pending_device_init(niri, &node);
+            return;
+        }
+
+        let Ok(node) = DrmNode::from_dev_id(device_id) else {
+            return;
+        };
+
+        let Some(pending) = self.pending_device_inits.get_mut(&node) else {
+            debug!("pending GPU init check cancelled because device was removed: {node:?}");
+            return;
+        };
+
+        let status = {
+            let lock = pending.wakeup_state.lock().unwrap();
+            match &*lock {
+                WakeupState::Woken { generation, .. } if *generation == pending.generation => {
+                    Some(Ok(()))
+                }
+                WakeupState::WokenNoFd { generation } if *generation == pending.generation => {
+                    Some(Ok(()))
+                }
+                WakeupState::Failed => Some(Err(())),
+                _ => None,
+            }
+        };
+
+        if let Some(result) = status {
+            if result.is_ok() {
+                debug!("gpu {node:?} is back, adding device");
+                let add_res = self.device_added(device_id, path, niri, true);
+                self.remove_pending_device_init(niri, &node);
+                if let Err(err) = add_res {
+                    error!("async gpu init failed: {err:?}");
+                }
+            } else {
+                self.remove_pending_device_init(niri, &node);
+                error!("gpu {node:?} failed to wake up, giving up");
+            }
+            return;
+        }
+
+        pending.attempts += 1;
+        if pending.attempts >= WAKEUP_ATTEMPTS {
+            error!("gave up waking gpu {node:?}, marking it failed");
+            self.remove_pending_device_init(niri, &node);
+            return;
+        }
+
+        let dev_id = node.dev_id();
+        let path = path.to_owned();
+
+        match niri.event_loop.insert_source(
+            Timer::from_duration(wakeup_retry_delay()),
+            move |_, _, state| {
+                if let Some(tty) = state.backend.tty_checked() {
+                    tty.check_async_device_init(dev_id, &path, &mut state.niri);
+                }
+
+                TimeoutAction::Drop
+            },
+        ) {
+            Ok(token) => {
+                if let Some(pending) = self.pending_device_inits.get_mut(&node) {
+                    pending.timer_token = Some(token);
+                }
+            }
+            Err(err) => {
+                error!("failed to schedule async gpu init check for {node:?}: {err:?}");
+                self.remove_pending_device_init(niri, &node);
+            }
+        }
+    }
+
+    fn check_async_device_resume(&mut self, key: DrmNode, niri: &mut Niri) {
+        if !self.session.is_active() {
+            self.reset_wakeup_state_by_key(niri, key, false);
+            return;
+        }
+
+        let Some(power) = self.gpu_power.get_mut(&key) else {
+            return;
+        };
+
+        let PowerState::WakingUp {
+            generation: current_gen,
+        } = power.state
+        else {
+            return;
+        };
+
+        power.wakeup_timer = None;
+
+        let status = {
+            let lock = power.wakeup_state.lock().unwrap();
+            match &*lock {
+                WakeupState::Woken { generation, .. } if *generation == current_gen => Some(Ok(())),
+                WakeupState::WokenNoFd { generation } if *generation == current_gen => Some(Ok(())),
+                WakeupState::Failed => Some(Err(())),
+                _ => None,
+            }
+        };
+
+        if let Some(result) = status {
+            if result.is_ok() {
+                debug!("gpu {key:?} is back, resuming");
+                if let Some(node) = self.find_active_primary_for_key(key) {
+                    match self.resume_device(niri, node, true) {
+                        Ok(gpu_topology_changed) => {
+                            if gpu_topology_changed {
+                                self.update_dmabuf_feedbacks(niri);
+                            }
+                            self.device_changed(node.dev_id(), niri, true);
+                            if let Some(power) = self.gpu_power.get_mut(&key) {
+                                power.state = PowerState::Active;
+                                *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+                            }
+                        }
+                        Err(()) => {
+                            error!("gpu {key:?} failed to resume after wakeup");
+                            self.reset_wakeup_state_by_key(niri, key, true);
+                        }
+                    }
+                } else {
+                    debug!("gpu {key:?} woke up but no active primary devices share this render node; resetting state");
+                    self.reset_wakeup_state_by_key(niri, key, false);
+                }
+            } else {
+                error!("gpu {key:?} failed to resume: wakeup failed");
+                self.reset_wakeup_state_by_key(niri, key, true);
+            }
+            return;
+        }
+
+        let attempts = power.resume_attempts;
+        if attempts >= WAKEUP_ATTEMPTS {
+            error!("gave up waking gpu {key:?}, marking it failed");
+            self.reset_wakeup_state_by_key(niri, key, true);
+            return;
+        }
+
+        power.resume_attempts += 1;
+
+        if self.schedule_wakeup_retry(niri, key).is_err() {
+            self.reset_wakeup_state_by_key(niri, key, true);
+        }
+    }
+
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<'static, State>,
@@ -526,6 +1245,13 @@ impl Tty {
             primary_render_node,
             ignored_nodes: HashSet::new(),
             devices: HashMap::new(),
+            pending_device_inits: HashMap::new(),
+            next_pending_init_generation: 0,
+            gpu_power: HashMap::new(),
+            system_pm: SystemPmState::Running,
+            gpu_gate: GpuGate::new(),
+            quiesce_timer: None,
+            inhibitor_fd: None,
             dmabuf_global: None,
             update_output_config_on_resume: false,
             debug_tint: false,
@@ -533,7 +1259,122 @@ impl Tty {
         })
     }
 
+    fn gpu_access_allowed(&self) -> bool {
+        self.system_pm == SystemPmState::Running && self.session.is_active()
+    }
+
+    pub fn on_prepare_for_sleep(&mut self, niri: &mut Niri, start: bool) {
+        if start {
+            info!("system PM: prepare for sleep (start=true)");
+            self.system_pm = SystemPmState::Quiescing;
+            self.gpu_gate.pm_generation.fetch_add(1, Ordering::SeqCst);
+            self.gpu_gate.open_allowed.store(false, Ordering::SeqCst);
+
+            for power in self.gpu_power.values_mut() {
+                if let Some(token) = power.suspend_timer.take() {
+                    niri.event_loop.remove(token);
+                }
+                if let Some(token) = power.wakeup_timer.take() {
+                    niri.event_loop.remove(token);
+                }
+                if let PowerState::WakingUp { .. } = power.state {
+                    power.state = PowerState::Suspended;
+                }
+                *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+            }
+
+            for pending in self.pending_device_inits.drain().map(|(_, v)| v) {
+                if let Some(token) = pending.timer_token {
+                    niri.event_loop.remove(token);
+                }
+                *pending.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+            }
+
+            if let Some(token) = self.quiesce_timer.take() {
+                niri.event_loop.remove(token);
+            }
+
+            if self.gpu_gate.active_access_guards.load(Ordering::SeqCst) == 0 {
+                self.inhibitor_fd = None;
+                self.system_pm = SystemPmState::Suspended;
+            } else {
+                let active_guards = self.gpu_gate.active_access_guards.clone();
+                let start = std::time::Instant::now();
+                let timeout = Duration::from_secs(4);
+
+                match niri.event_loop.insert_source(
+                    Timer::from_duration(Duration::from_millis(20)),
+                    move |_, _, state| {
+                        let Some(tty) = state.backend.tty_checked() else {
+                            return TimeoutAction::Drop;
+                        };
+                        if tty.system_pm != SystemPmState::Quiescing {
+                            tty.quiesce_timer = None;
+                            return TimeoutAction::Drop;
+                        }
+                        if active_guards.load(Ordering::SeqCst) == 0 {
+                            debug!("dGPU background access drained successfully before sleep");
+                            tty.inhibitor_fd = None;
+                            tty.system_pm = SystemPmState::Suspended;
+                            tty.quiesce_timer = None;
+                            TimeoutAction::Drop
+                        } else if start.elapsed() >= timeout {
+                            warn!("dGPU background access drain timed out during quiesce");
+                            tty.inhibitor_fd = None;
+                            tty.system_pm = SystemPmState::Suspended;
+                            tty.quiesce_timer = None;
+                            TimeoutAction::Drop
+                        } else {
+                            TimeoutAction::ToDuration(Duration::from_millis(20))
+                        }
+                    },
+                ) {
+                    Ok(token) => {
+                        self.quiesce_timer = Some(token);
+                    }
+                    Err(err) => {
+                        warn!("failed to schedule GPU quiesce timer: {err:?}");
+                        self.inhibitor_fd = None;
+                        self.system_pm = SystemPmState::Suspended;
+                    }
+                }
+            }
+        } else {
+            info!("system PM: prepare for sleep (start=false, resume)");
+            self.system_pm = SystemPmState::ResumePending;
+            self.gpu_gate.pm_generation.fetch_add(1, Ordering::SeqCst);
+
+            if let Some(token) = self.quiesce_timer.take() {
+                niri.event_loop.remove(token);
+            }
+
+            for power in self.gpu_power.values_mut() {
+                if power.state == PowerState::Failed {
+                    power.state = PowerState::Suspended;
+                }
+            }
+
+            #[cfg(feature = "dbus")]
+            {
+                self.inhibitor_fd = crate::dbus::freedesktop_login1::take_sleep_inhibitor_system();
+            }
+
+            self.gpu_gate.open_allowed.store(true, Ordering::SeqCst);
+            self.system_pm = SystemPmState::Running;
+
+            if self.update_output_config_on_resume {
+                self.update_output_config_on_resume = false;
+                self.on_output_config_changed(niri);
+            }
+        }
+    }
+
     pub fn init(&mut self, niri: &mut Niri) {
+        #[cfg(feature = "dbus")]
+        {
+            self.inhibitor_fd = crate::dbus::freedesktop_login1::take_sleep_inhibitor_system();
+        }
+
         // If the session is inactive, skip initialization because we won't be able to do much with
         // the devices anyway. We'll get ActivateSession and add the devices there instead.
         //
@@ -554,7 +1395,8 @@ impl Tty {
             .device_list()
             .find(|&(device_id, _)| device_id == self.primary_node.dev_id())
         {
-            if let Err(err) = self.device_added(primary_device_id, primary_device_path, niri) {
+            if let Err(err) = self.device_added(primary_device_id, primary_device_path, niri, false)
+            {
                 warn!(
                     "error adding primary node device, display-only devices may not work: {err:?}"
                 );
@@ -568,7 +1410,7 @@ impl Tty {
                 continue;
             }
 
-            if let Err(err) = self.device_added(device_id, path, niri) {
+            if let Err(err) = self.device_added(device_id, path, niri, false) {
                 warn!("error adding device: {err:?}");
             }
         }
@@ -588,7 +1430,7 @@ impl Tty {
                 // new underlying device IDs.
                 self.ignored_nodes = self.compute_ignored_nodes();
 
-                if let Err(err) = self.device_added(device_id, &path, niri) {
+                if let Err(err) = self.device_added(device_id, &path, niri, false) {
                     warn!("error adding device: {err:?}");
                 }
             }
@@ -626,6 +1468,7 @@ impl Tty {
                 niri.event_loop
                     .insert_idle(|state| state.release_held_inputs());
 
+                self.gpu_gate.open_allowed.store(false, Ordering::SeqCst);
                 self.libinput.suspend();
 
                 for device in self.devices.values_mut() {
@@ -638,6 +1481,10 @@ impl Tty {
             }
             SessionEvent::ActivateSession => {
                 debug!("resuming session");
+
+                if self.system_pm == SystemPmState::Running {
+                    self.gpu_gate.open_allowed.store(true, Ordering::SeqCst);
+                }
 
                 if self.libinput.resume().is_err() {
                     warn!("error resuming libinput");
@@ -684,6 +1531,19 @@ impl Tty {
                 for node in remained_devices {
                     device_list.remove(&node.dev_id());
 
+                    let key = self.gpu_power_key(node);
+                    let is_suspended = self
+                        .gpu_power
+                        .get_mut(&key)
+                        .map(|power| {
+                            if power.state == PowerState::Failed {
+                                power.state = PowerState::Suspended;
+                            }
+                            power.state == PowerState::Suspended
+                                || matches!(power.state, PowerState::WakingUp { .. })
+                        })
+                        .unwrap_or(false);
+
                     // It hasn't been removed, update its state as usual.
                     let device = self.devices.get_mut(&node).unwrap();
 
@@ -695,7 +1555,11 @@ impl Tty {
                         .debug
                         .force_disable_connectors_on_resume;
 
-                    if let Err(err) = device.drm.activate(force_disable) {
+                    if is_suspended {
+                        debug!(
+                            "skipping synchronous drm.activate on suspended secondary GPU {node:?}"
+                        );
+                    } else if let Err(err) = device.drm.activate(force_disable) {
                         warn!("error activating DRM device: {err:?}");
                     }
                     if let Some(lease_state) = &mut device.drm_lease_state {
@@ -743,7 +1607,7 @@ impl Tty {
                 let primary = primary_device_path.map(|path| (primary_device_id, path));
 
                 for (device_id, path) in primary.into_iter().chain(device_list) {
-                    if let Err(err) = self.device_added(device_id, &path, niri) {
+                    if let Err(err) = self.device_added(device_id, &path, niri, false) {
                         warn!("error adding device: {err:?}");
                     }
                 }
@@ -767,14 +1631,11 @@ impl Tty {
         device_id: dev_t,
         path: &Path,
         niri: &mut Niri,
+        is_retry: bool,
     ) -> anyhow::Result<()> {
         debug!("adding device: {device_id} {path:?}");
 
         let node = DrmNode::from_dev_id(device_id)?;
-
-        if node == self.primary_node {
-            debug!("this is the primary node");
-        }
 
         // Only consider primary node on udev event
         // https://gitlab.freedesktop.org/wlroots/wlroots/-/commit/768fbaad54027f8dd027e7e015e8eeb93cb38c52
@@ -788,6 +1649,98 @@ impl Tty {
             return Ok(());
         }
 
+        if self.devices.contains_key(&node) {
+            debug!("device {node:?} already exists, skipping duplicate add");
+            self.remove_pending_device_init(niri, &node);
+            return Ok(());
+        }
+
+        let early_render_node = if node == self.primary_node {
+            node.node_with_type(NodeType::Render).and_then(Result::ok)
+        } else {
+            None
+        };
+        self.prime_gpu_power_state(node, early_render_node);
+
+        if !is_retry && node != self.primary_node {
+            if self.pending_device_inits.contains_key(&node) {
+                debug!("gpu {node:?} is already in the process of initialization, skipping duplicate add event");
+                return Ok(());
+            }
+
+            let is_waking_up = self
+                .gpu_power
+                .get(&self.gpu_power_key(node))
+                .map(|p| matches!(p.state, PowerState::WakingUp { .. }))
+                .unwrap_or(false);
+            if is_waking_up {
+                debug!(
+                    "gpu {node:?} is already waking up from suspend, skipping duplicate add event"
+                );
+                return Ok(());
+            }
+
+            let render_target = node
+                .node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .and_then(|rn| rn.dev_path().map(|path| (path, rn.dev_id())));
+
+            let wakeup_state = Arc::new(Mutex::new(WakeupState::Pending));
+            self.next_pending_init_generation =
+                self.next_pending_init_generation.wrapping_add(1).max(1);
+            let generation = self.next_pending_init_generation;
+
+            self.pending_device_inits.insert(
+                node,
+                PendingDeviceInit {
+                    attempts: 0,
+                    generation,
+                    timer_token: None,
+                    wakeup_state: wakeup_state.clone(),
+                },
+            );
+
+            if let Some((render_path, expected_dev_id)) = render_target {
+                spawn_gpu_wakeup_thread(
+                    render_path,
+                    expected_dev_id,
+                    generation,
+                    self.gpu_gate.pm_generation.load(Ordering::SeqCst),
+                    self.gpu_gate.clone(),
+                    wakeup_state,
+                );
+            } else {
+                // Display-only devices (like DisplayLink) don't have a render node or slow PCIe wakeups.
+                *wakeup_state.lock().unwrap() = WakeupState::WokenNoFd { generation };
+            }
+
+            let dev_id = node.dev_id();
+            let path_buf = path.to_owned();
+            match niri.event_loop.insert_source(
+                Timer::from_duration(wakeup_retry_delay()),
+                move |_, _, state| {
+                    if let Some(tty) = state.backend.tty_checked() {
+                        tty.check_async_device_init(dev_id, &path_buf, &mut state.niri);
+                    }
+                    TimeoutAction::Drop
+                },
+            ) {
+                Ok(token) => {
+                    if let Some(pending) = self.pending_device_inits.get_mut(&node) {
+                        pending.timer_token = Some(token);
+                    }
+                }
+                Err(e) => {
+                    error!("failed to schedule async GPU init check for {node:?}: {e:?}");
+                    self.remove_pending_device_init(niri, &node);
+                    return Err(anyhow::anyhow!(
+                        "failed to schedule async GPU init check: {e:?}"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
         let _span = tracy_client::span!("Tty::device_added");
 
         let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
@@ -795,51 +1748,76 @@ impl Tty {
             let _span = tracy_client::span!("LibSeatSession::open");
             self.session.open(path, open_flags)
         }?;
-        let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        let raw_device_fd = DeviceFd::from(fd);
+        let device_fd = DrmDeviceFd::new(raw_device_fd.clone());
 
-        let (drm, drm_notifier) = {
-            let _span = tracy_client::span!("DrmDevice::new");
-            DrmDevice::new(device_fd.clone(), false)
-        }?;
-        let gbm = {
-            let _span = tracy_client::span!("GbmDevice::new");
-            GbmDevice::new(device_fd.device_fd())
-        }?;
-
-        let mut try_initialize_gpu = || {
-            let display = unsafe { EGLDisplay::new(gbm.clone())? };
-            let egl_device = EGLDevice::device_for_display(&display)?;
-
-            // Software EGL devices (e.g., llvmpipe/softpipe) are rejected for now. They have some
-            // problems (segfault on importing dmabufs from other renderers) and need to be
-            // excluded from some places like DRM leasing.
-            ensure!(
-                !egl_device.is_software(),
-                "software EGL renderers are skipped"
-            );
-
-            let render_node = egl_device
-                .try_get_render_node()
-                .ok()
-                .flatten()
-                .unwrap_or(node);
-            self.gpu_manager
-                .as_mut()
-                .add_node(render_node, gbm.clone())
-                .context("error adding render node to GPU manager")?;
-
-            Ok(render_node)
+        let (drm, drm_notifier) = match DrmDevice::new(device_fd.clone(), false) {
+            Ok(res) => res,
+            Err(err) => {
+                return_device_fd(&mut self.session, device_fd, raw_device_fd);
+                return Err(err.into());
+            }
         };
 
-        let render_node = match try_initialize_gpu() {
-            Ok(render_node) => {
-                debug!("got render node: {render_node}");
-                Some(render_node)
-            }
+        let gbm = match GbmDevice::new(device_fd.device_fd()) {
+            Ok(res) => res,
             Err(err) => {
-                debug!("failed to initialize renderer, falling back to primary gpu: {err:?}");
-                None
+                drop(drm_notifier);
+                drop(drm);
+                return_device_fd(&mut self.session, device_fd, raw_device_fd);
+                return Err(err.into());
             }
+        };
+
+        let render_node = if node == self.primary_node {
+            let mut try_initialize_gpu = || -> Result<Option<DrmNode>, anyhow::Error> {
+                let display = unsafe { EGLDisplay::new(gbm.clone())? };
+                let egl_device = EGLDevice::device_for_display(&display)?;
+
+                // Software renderers segfault on dmabuf import and mess up DRM leasing,
+                // so skip render integration but keep the device for scanout.
+                if egl_device.is_software() {
+                    return Ok(None);
+                }
+
+                let render_node = egl_device
+                    .try_get_render_node()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(node);
+                self.gpu_manager
+                    .as_mut()
+                    .add_node(render_node, gbm.clone())
+                    .context("error adding render node to GPU manager")?;
+
+                Ok(Some(render_node))
+            };
+
+            let gpu_init = try_initialize_gpu();
+
+            match gpu_init {
+                Ok(Some(render_node)) => {
+                    debug!("got primary render node: {render_node}");
+                    self.remove_pending_device_init(niri, &node);
+                    Some(render_node)
+                }
+                Ok(None) => {
+                    debug!("gpu {node:?} is a software renderer, skipping rendering integration");
+                    self.remove_pending_device_init(niri, &node);
+                    None
+                }
+                Err(err) => {
+                    self.remove_pending_device_init(niri, &node);
+                    debug!("failed to initialize primary renderer for {node:?}: {err:?}");
+                    None
+                }
+            }
+        } else {
+            // Don't register secondary GPUs with gpu_manager/EGL; they're only used for KMS scanout.
+            // This avoids driver allocations and threads that would prevent runtime D3cold suspend.
+            debug!("secondary GPU {node:?} initialized as pure KMS scanout sink (no EGLDisplay/GlesRenderer)");
+            self.remove_pending_device_init(niri, &node);
+            None
         };
 
         if render_node == Some(self.primary_render_node) && self.dmabuf_global.is_none() {
@@ -879,9 +1857,22 @@ impl Tty {
             // Create the dmabuf global.
             let primary_formats = renderer.dmabuf_formats();
             let default_feedback =
-                DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
+                match DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
                     .build()
-                    .context("error building default dmabuf feedback")?;
+                    .context("error building default dmabuf feedback")
+                {
+                    Ok(fb) => fb,
+                    Err(err) => {
+                        drop(renderer);
+                        self.gpu_manager.as_mut().remove_node(&render_node);
+                        drop(drm_notifier);
+                        drop(drm);
+                        drop(gbm);
+                        self.sync_gpu_manager_devices();
+                        return_device_fd(&mut self.session, device_fd, raw_device_fd);
+                        return Err(err);
+                    }
+                };
             let dmabuf_global = niri
                 .dmabuf_state
                 .create_global_with_default_feedback::<State>(
@@ -916,6 +1907,10 @@ impl Tty {
         } else if let Some(primary_device) = self.devices.get(&self.primary_node) {
             primary_device.gbm.clone()
         } else {
+            drop(drm_notifier);
+            drop(drm);
+            drop(gbm);
+            return_device_fd(&mut self.session, device_fd, raw_device_fd);
             bail!("no allocator available for device");
         };
         let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
@@ -939,6 +1934,8 @@ impl Tty {
             .map_err(|err| warn!("error initializing DRM leasing for {node}: {err:?}"))
             .ok();
 
+        let _power = self.migrate_and_prepare_gpu_power_state(niri, node, render_node);
+
         let device = OutputDevice {
             token,
             render_node,
@@ -952,14 +1949,184 @@ impl Tty {
             active_leases: Vec::new(),
             non_desktop_connectors: HashSet::new(),
         };
-        assert!(self.devices.insert(node, device).is_none());
+        match self.devices.entry(node) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(device);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                if let Some(render_node) = render_node {
+                    self.gpu_manager.as_mut().remove_node(&render_node);
+                }
+                niri.event_loop.remove(device.token);
+                drop(device); // drm and gbm live inside, must go before closing the fd
+                self.sync_gpu_manager_devices();
+                return_device_fd(&mut self.session, device_fd, raw_device_fd);
+                bail!("device {node:?} was unexpectedly already present in self.devices");
+            }
+        }
 
         self.device_changed(device_id, niri, true);
 
         Ok(())
     }
 
-    fn device_changed(&mut self, device_id: dev_t, niri: &mut Niri, cleanup: bool) {
+    pub(crate) fn check_suspend_device(&mut self, niri: &mut Niri, node: DrmNode) {
+        if !self.gpu_access_allowed() {
+            return;
+        }
+
+        let key = self.gpu_power_key(node);
+        let should_suspend = node != self.primary_node
+            && self
+                .gpu_power
+                .get(&key)
+                .map(|power| power.state == PowerState::Active)
+                .unwrap_or(false)
+            && is_device_idle_and_last(self, node);
+
+        if !should_suspend {
+            if let Some(power) = self.gpu_power.get_mut(&key) {
+                if let Some(token) = power.suspend_timer.take() {
+                    niri.event_loop.remove(token);
+                }
+            }
+            return;
+        }
+
+        let Some(_device) = self.devices.get(&node) else {
+            return;
+        };
+
+        if self
+            .gpu_power
+            .get(&key)
+            .and_then(|power| power.suspend_timer.as_ref())
+            .is_some()
+        {
+            return;
+        }
+
+        debug!("secondary GPU {node:?} idle, suspending in {SUSPEND_TIMEOUT_SECS}s");
+
+        let token = match niri.event_loop.insert_source(
+            Timer::from_duration(std::time::Duration::from_secs(SUSPEND_TIMEOUT_SECS)),
+            move |_, _, state| {
+                let Some(tty) = state.backend.tty_checked() else {
+                    return TimeoutAction::Drop;
+                };
+
+                let Some(node) = tty.find_active_primary_for_key(key) else {
+                    debug!("secondary GPU timer fired for key {key:?}, but no active primary devices share it; ignoring suspend");
+                    return TimeoutAction::Drop;
+                };
+
+                if let Some(power) = tty.gpu_power.get_mut(&key) {
+                    power.suspend_timer = None;
+                }
+
+                if !tty.gpu_access_allowed() {
+                    return TimeoutAction::Drop;
+                }
+
+                if !is_device_idle_and_last(tty, node) {
+                    return TimeoutAction::Drop;
+                }
+
+                if node == tty.primary_node {
+                    warn!("attempted to suspend primary node; skipping suspend");
+                    return TimeoutAction::Drop;
+                }
+
+                tty.cancel_gpu_power_timer_by_key(&mut state.niri, key);
+
+                // Turn off CRTCs and clear property blobs so the device can enter D3cold.
+                if let Some(device) = tty.devices.get(&node) {
+                    if let Err(err) = device.cleanup_mismatching_resources(&|_, _| true) {
+                        warn!("error disabling CRTCs prior to secondary GPU suspend: {err:?}");
+                    }
+                }
+
+                if let Some(power) = tty.gpu_power.get_mut(&key) {
+                    power.state = PowerState::Suspended;
+                    power.resume_attempts = 0;
+                    *power.wakeup_state.lock().unwrap() =
+                        WakeupState::Cancelled;
+                }
+
+                debug!("secondary GPU {node:?} timer up, suspended (CRTCs disabled, ready for D3cold)");
+
+                TimeoutAction::Drop
+            },
+        ) {
+            Ok(token) => token,
+            Err(err) => {
+                error!("couldn't set suspend timer for GPU {node:?}: {err:?}");
+                return;
+            }
+        };
+
+        self.gpu_power_state_mut(node).suspend_timer = Some(token);
+    }
+
+    pub(crate) fn resume_device(
+        &mut self,
+        niri: &mut Niri,
+        node: DrmNode,
+        is_retry: bool,
+    ) -> Result<bool, ()> {
+        if !self.devices.contains_key(&node) {
+            return Ok(false);
+        }
+
+        let key = self.gpu_power_key(node);
+
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            if !should_start_gpu_wakeup(power, is_retry) {
+                if power.state == PowerState::Failed && !is_retry {
+                    debug!("gpu {key:?} failed to wake before, not touching it again");
+                }
+                return Err(());
+            }
+            if power.state == PowerState::Failed {
+                power.state = PowerState::Suspended;
+            }
+            if let Some(token) = power.suspend_timer.take() {
+                niri.event_loop.remove(token);
+            }
+        }
+
+        let was_suspended = self
+            .gpu_power
+            .get(&key)
+            .map(|power| {
+                matches!(
+                    power.state,
+                    PowerState::Suspended | PowerState::WakingUp { .. }
+                )
+            })
+            .unwrap_or(false);
+
+        if !was_suspended {
+            if let Some(power) = self.gpu_power.get_mut(&key) {
+                power.state = PowerState::Active;
+                power.resume_attempts = 0;
+            }
+            return Ok(false);
+        }
+
+        if !is_retry {
+            self.start_gpu_wakeup(niri, node)?;
+            return Err(());
+        }
+
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            power.state = PowerState::Active;
+            power.resume_attempts = 0;
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn device_changed(&mut self, device_id: dev_t, niri: &mut Niri, cleanup: bool) {
         debug!("device changed: {device_id}");
 
         let Ok(node) = DrmNode::from_dev_id(device_id) else {
@@ -972,6 +2139,34 @@ impl Tty {
             return;
         }
 
+        let key = self.gpu_power_key(node);
+        if let Some(power) = self.gpu_power.get(&key) {
+            match power.state {
+                PowerState::WakingUp { .. } => {
+                    debug!("holding udev event until wakeup is done");
+                    return;
+                }
+                PowerState::Suspended => {
+                    debug!(
+                        "secondary GPU {device_id} is suspended, triggering async wakeup instead of scanning connectors"
+                    );
+                    if let Err(err) = self.start_gpu_wakeup(niri, node) {
+                        warn!("failed to start async GPU wakeup for device {device_id}: {err:?}");
+                    }
+                    return;
+                }
+                PowerState::Failed => {
+                    debug!("ignoring udev change event for failed GPU {device_id}");
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(power) = self.gpu_power.get_mut(&key) {
+            power.resume_attempts = 0;
+        }
+
         if self.ignored_nodes.contains(&node) {
             debug!("node is ignored, skipping");
             return;
@@ -981,7 +2176,7 @@ impl Tty {
             if let Some(path) = node.dev_path() {
                 warn!("unknown device; trying to add");
 
-                if let Err(err) = self.device_added(device_id, &path, niri) {
+                if let Err(err) = self.device_added(device_id, &path, niri, false) {
                     warn!("error adding device: {err:?}");
                 }
             } else {
@@ -1064,8 +2259,8 @@ impl Tty {
             return;
         };
 
-        for crtc in removed {
-            if device.known_crtcs.remove(&crtc).is_none() {
+        for crtc in &removed {
+            if device.known_crtcs.remove(crtc).is_none() {
                 error!("output ID missing for disconnected crtc: {crtc:?}");
             }
         }
@@ -1101,9 +2296,9 @@ impl Tty {
             device.known_crtcs.insert(crtc, info);
         }
 
-        // If the device was just added or resumed, we need to cleanup any disconnected connectors
-        // and planes.
-        if cleanup {
+        // Cleanup disabled or disconnected connectors, CRTCs, and planes.
+        let needs_cleanup = cleanup || !removed.is_empty();
+        if needs_cleanup {
             let device = self.devices.get(&node).unwrap();
 
             // Follow the logic in on_output_config_changed().
@@ -1162,8 +2357,16 @@ impl Tty {
             return;
         }
 
+        let key = self.gpu_power_key(node);
+
         let Some(device) = self.devices.get_mut(&node) else {
-            warn!("unknown device");
+            // Stop the wakeup thread if udev removed the device first.
+            if self.pending_device_inits.contains_key(&node) {
+                self.remove_pending_device_init(niri, &node);
+                debug!("cancelled pending async GPU init for removed device {node:?}");
+            } else {
+                warn!("unknown device");
+            }
             return;
         };
 
@@ -1180,6 +2383,23 @@ impl Tty {
         let mut device = self.devices.remove(&node).unwrap();
         let device_fd = device.drm.device_fd().device_fd();
 
+        let was_last_primary_user = if let Some(render_node) = device.render_node {
+            !self
+                .devices
+                .values()
+                .any(|device| device.render_node == Some(render_node))
+        } else {
+            true
+        };
+
+        if was_last_primary_user {
+            self.cancel_gpu_power_timer_by_key(niri, key);
+            if let Some(power) = self.gpu_power.get(&key) {
+                *power.wakeup_state.lock().unwrap() = WakeupState::Cancelled;
+            }
+            self.gpu_power.remove(&key);
+        }
+
         if let Some(lease_state) = &mut device.drm_lease_state {
             lease_state.disable_global::<State>();
         }
@@ -1188,10 +2408,9 @@ impl Tty {
             // Sometimes (Asahi DisplayLink), multiple primary nodes will correspond to the same
             // render node. In this case, we want to keep the render node active until the last
             // primary node that uses it is gone.
-            let was_last = !self
-                .devices
-                .values()
-                .any(|device| device.render_node == Some(render_node));
+            let was_last = !self.devices.iter().any(|(other_node, other)| {
+                *other_node != node && other.render_node == Some(render_node)
+            });
 
             if was_last && render_node == self.primary_render_node {
                 debug!("destroying the primary renderer");
@@ -1233,8 +2452,9 @@ impl Tty {
 
             if was_last {
                 self.gpu_manager.as_mut().remove_node(&render_node);
-                // Trigger re-enumeration in order to remove the device from gpu_manager.
-                let _ = self.gpu_manager.devices();
+                // Nudge gpu_manager to forget the removed render node.
+                self.sync_gpu_manager_devices();
+                self.update_dmabuf_feedbacks(niri);
             }
         }
 
@@ -1428,6 +2648,24 @@ impl Tty {
         // would still be a bad idea to remove this until Smithay has some kind of full-device
         // modesetting test that is able to "downgrade" existing connector modifiers to get enough
         // bandwidth for a newly connected one.
+        let supported_colors = if self.config.borrow().debug.disable_10bit_output {
+            &SUPPORTED_COLOR_FORMATS[..]
+        } else {
+            &SUPPORTED_COLOR_FORMATS_10BIT[..]
+        };
+
+        let invalid_candidates =
+            if device.render_node.is_none() {
+                Some(supported_colors.iter().copied().map(|code| {
+                    smithay::backend::allocator::Format {
+                        code,
+                        modifier: Modifier::Invalid,
+                    }
+                }))
+            } else {
+                None
+            };
+
         let render_formats = render_formats
             .iter()
             .copied()
@@ -1455,15 +2693,10 @@ impl Tty {
 
                 !is_ccs
             })
+            .chain(invalid_candidates.into_iter().flatten())
             .collect::<FormatSet>();
 
-        let color_formats = if self.config.borrow().debug.disable_10bit_output {
-            &SUPPORTED_COLOR_FORMATS[..]
-        } else {
-            &SUPPORTED_COLOR_FORMATS_10BIT[..]
-        }
-        .iter()
-        .copied();
+        let color_formats = supported_colors.iter().copied();
 
         // Create the compositor.
         let res = DrmCompositor::new(
@@ -1485,11 +2718,22 @@ impl Tty {
             Err(err) => {
                 warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
 
-                let render_formats = render_formats
+                let mut invalid_render_formats = render_formats
                     .iter()
                     .copied()
                     .filter(|format| format.modifier == Modifier::Invalid)
                     .collect::<FormatSet>();
+
+                if invalid_render_formats.indexset().is_empty() {
+                    invalid_render_formats = supported_colors
+                        .iter()
+                        .copied()
+                        .map(|code| smithay::backend::allocator::Format {
+                            code,
+                            modifier: Modifier::Invalid,
+                        })
+                        .collect::<FormatSet>();
+                }
 
                 // DrmCompositor::new() consumed the surface...
                 let surface = device
@@ -1503,7 +2747,7 @@ impl Tty {
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
                     color_formats,
-                    render_formats,
+                    invalid_render_formats,
                     device.drm.cursor_size(),
                     Some(device.gbm.clone()),
                 )
@@ -2380,7 +3624,7 @@ impl Tty {
         }
 
         for (device_id, path) in device_list {
-            if let Err(err) = self.device_added(device_id, &path, niri) {
+            if let Err(err) = self.device_added(device_id, &path, niri, false) {
                 warn!("error adding device {path:?}: {err:?}");
             }
         }
@@ -2596,13 +3840,69 @@ impl Tty {
         // startup, when multiple connectors appear at once.
         to_connect.sort_unstable_by(|a, b| a.3.compare(&b.3));
 
+        let mut gpu_topology_changed = false;
+        let mut failed_resume_nodes = HashSet::new();
+
         for (node, connector, crtc, _name) in to_connect {
+            if failed_resume_nodes.contains(&node) {
+                continue;
+            }
+
+            // Smithay wants the renderer back before we touch connectors.
+            match self.resume_device(niri, node, false) {
+                Ok(true) => gpu_topology_changed = true,
+                Ok(false) => {}
+                Err(_) => {
+                    failed_resume_nodes.insert(node);
+                    continue;
+                }
+            }
+
             if let Err(err) = self.connector_connected(niri, node, connector, crtc) {
                 warn!("error connecting connector: {err:?}");
             }
         }
 
         self.refresh_ipc_outputs(niri);
+
+        let nodes: Vec<_> = self.devices.keys().copied().collect();
+        for node in nodes {
+            let key = self.gpu_power_key(node);
+            let disable_suspend = self.config.borrow().debug.disable_idle_drm_device_suspend
+                || self
+                    .gpu_power
+                    .get(&key)
+                    .map(|p| p.disable_suspend_due_to_nvidia_vram)
+                    .unwrap_or(false);
+            if disable_suspend {
+                if let Some(power) = self.gpu_power.get_mut(&key) {
+                    if power.state == PowerState::Failed {
+                        power.state = PowerState::Suspended;
+                    }
+                }
+                if !failed_resume_nodes.contains(&node) {
+                    match self.resume_device(niri, node, false) {
+                        Ok(true) => gpu_topology_changed = true,
+                        Ok(false) => {}
+                        Err(_) => {}
+                    }
+                }
+            } else {
+                self.check_suspend_device(niri, node);
+            }
+        }
+
+        if gpu_topology_changed {
+            self.update_dmabuf_feedbacks(niri);
+        }
+    }
+
+    pub fn primary_node(&self) -> DrmNode {
+        self.primary_node
+    }
+
+    pub fn has_device(&self, node: DrmNode) -> bool {
+        self.devices.contains_key(&node)
     }
 
     pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
@@ -3098,9 +4398,9 @@ fn queue_estimated_vblank_timer(
     let token = niri
         .event_loop
         .insert_source(timer, move |_, _, data| {
-            data.backend
-                .tty()
-                .on_estimated_vblank_timer(&mut data.niri, output.clone());
+            if let Some(tty) = data.backend.tty_checked() {
+                tty.on_estimated_vblank_timer(&mut data.niri, output.clone());
+            }
             TimeoutAction::Drop
         })
         .unwrap();
