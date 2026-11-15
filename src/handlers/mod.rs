@@ -658,10 +658,10 @@ impl DrmLeaseHandler for State {
         self.backend
             .tty()
             .get_device_from_node(node)
-            .unwrap()
+            .expect("device must exist for DRM lease state")
             .drm_lease_state
             .as_mut()
-            .unwrap()
+            .expect("device must have DRM lease state")
     }
 
     fn lease_request(
@@ -673,29 +673,35 @@ impl DrmLeaseHandler for State {
             "Received lease request for {} connectors",
             request.connectors.len()
         );
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .lease_request(request)
+        let Some(device) = self.backend.tty().get_device_from_node(node) else {
+            warn!("lease request for unknown or removed DRM device {node:?}");
+            return Err(LeaseRejected::default());
+        };
+        device.lease_request(request)
     }
 
     fn new_active_lease(&mut self, node: DrmNode, lease: DrmLease) {
         debug!("Lease success");
+        let Some(device) = self.backend.tty().get_device_from_node(node) else {
+            warn!("new lease for unknown or removed DRM device {node:?}");
+            return;
+        };
+        device.new_lease(lease);
         self.backend
             .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .new_lease(lease);
+            .check_suspend_device(&mut self.niri, node);
     }
 
     fn lease_destroyed(&mut self, node: DrmNode, lease_id: u32) {
         debug!("Destroyed lease");
+        let Some(device) = self.backend.tty().get_device_from_node(node) else {
+            warn!("lease destroyed for unknown DRM device {node:?}");
+            return;
+        };
+        device.remove_lease(lease_id);
         self.backend
             .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .remove_lease(lease_id);
+            .check_suspend_device(&mut self.niri, node);
     }
 }
 
