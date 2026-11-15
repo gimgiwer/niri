@@ -2878,6 +2878,7 @@ mod tests {
                 skip_cursor_only_updates_during_vrr: false,
                 disable_10bit_output: false,
                 nested_show_host_cursor: false,
+                disable_idle_drm_device_suspend: false,
             },
             workspaces: [
                 Workspace {
