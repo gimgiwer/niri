@@ -980,6 +980,20 @@ window-rule {
 }
 ```
 
+#### `fullscreen-backdrop-color`
+
+<sup>Since: next release</sup>
+
+Override the solid backdrop color rendered behind this window when it is fullscreen.
+Can be set to `"transparent"`, or a color in hex format (e.g. `"#000000"` or `"#12345680"`).
+
+```kdl
+window-rule {
+    match app-id="foot"
+    fullscreen-backdrop-color "transparent"
+}
+```
+
 #### `tiled-state`
 
 <sup>Since: 25.05</sup>
