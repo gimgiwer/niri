@@ -191,7 +191,9 @@ impl<W: LayoutElement> Tile<W> {
         let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let sizing_mode = window.sizing_mode();
-        let fullscreen_backdrop_color = options.layout.fullscreen_backdrop_color;
+        let fullscreen_backdrop_color = rules
+            .fullscreen_backdrop_color
+            .unwrap_or(options.layout.fullscreen_backdrop_color);
 
         Self {
             window,
@@ -238,8 +240,13 @@ impl<W: LayoutElement> Tile<W> {
         self.scale = scale;
         self.options = options;
 
+        let fullscreen_backdrop_color = self
+            .window
+            .rules()
+            .fullscreen_backdrop_color
+            .unwrap_or(self.options.layout.fullscreen_backdrop_color);
         self.fullscreen_backdrop
-            .set_color(self.options.layout.fullscreen_backdrop_color);
+            .set_color(fullscreen_backdrop_color);
 
         let round_max1 = |logical| round_logical_in_physical_max1(self.scale, logical);
 
@@ -409,6 +416,12 @@ impl<W: LayoutElement> Tile<W> {
 
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
+
+        let fullscreen_backdrop_color = rules
+            .fullscreen_backdrop_color
+            .unwrap_or(self.options.layout.fullscreen_backdrop_color);
+        self.fullscreen_backdrop
+            .set_color(fullscreen_backdrop_color);
 
         let window_size = self.window_size();
         let radius = self
@@ -804,6 +817,32 @@ impl<W: LayoutElement> Tile<W> {
         loc
     }
 
+    pub(crate) fn fullscreen_backdrop_color(&self) -> niri_config::Color {
+        self.window
+            .rules()
+            .fullscreen_backdrop_color
+            .unwrap_or(self.options.layout.fullscreen_backdrop_color)
+    }
+
+    pub(crate) fn renders_fullscreen_backdrop(&self) -> bool {
+        self.fullscreen_backdrop_color().a > 0.
+    }
+
+    pub(crate) fn effective_window_alpha(&self) -> f32 {
+        if self.window.is_ignoring_opacity_window_rule() {
+            1.
+        } else {
+            let alpha = self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.);
+
+            if self.fullscreen_backdrop_color().a < 1.0 {
+                alpha
+            } else {
+                let p = self.fullscreen_progress() as f32;
+                alpha * (1. - p) + 1. * p
+            }
+        }
+    }
+
     pub fn tile_size(&self) -> Size<f64, Logical> {
         let mut size = self.window_size();
 
@@ -1079,15 +1118,8 @@ impl<W: LayoutElement> Tile<W> {
         let fullscreen_progress = self.fullscreen_progress();
         let expanded_progress = self.expanded_progress();
 
-        let win_alpha = if self.window.is_ignoring_opacity_window_rule() {
-            1.
-        } else {
-            let alpha = self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.);
-
-            // Interpolate towards alpha = 1. at fullscreen.
-            let p = fullscreen_progress as f32;
-            alpha * (1. - p) + 1. * p
-        };
+        let should_draw_fullscreen_backdrop = self.renders_fullscreen_backdrop();
+        let win_alpha = self.effective_window_alpha();
 
         // This is here rather than in render_offset() because render_offset() is currently assumed
         // by the code to be temporary. So, for example, interactive move will try to "grab" the
@@ -1282,7 +1314,7 @@ impl<W: LayoutElement> Tile<W> {
                 });
         }
 
-        if fullscreen_progress > 0. {
+        if fullscreen_progress > 0. && should_draw_fullscreen_backdrop {
             let alpha = fullscreen_progress as f32;
 
             // During the un/fullscreen animation, render a border element in order to use the
