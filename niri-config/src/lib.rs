@@ -1399,6 +1399,8 @@ mod tests {
                     active-color "#f00"
                 }
 
+                fullscreen-backdrop-color "transparent"
+
                 pinch-sensitivity 1.2
             }
 
@@ -2380,6 +2382,14 @@ mod tests {
                         urgent_gradient: None,
                     },
                     draw_border_with_background: None,
+                    fullscreen_backdrop_color: Some(
+                        Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        },
+                    ),
                     opacity: None,
                     geometry_corner_radius: None,
                     clip_to_geometry: None,
