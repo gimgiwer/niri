@@ -1053,6 +1053,30 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
+                            None,
+                        ) {
+                            warn!("error taking screenshot: {err:?}");
+                        }
+                    });
+                }
+            }
+            Action::ScreenshotWindowWithOptions {
+                write_to_disk,
+                show_pointer,
+                path,
+                rule,
+            } => {
+                let focus = self.niri.layout.focus_with_output();
+                if let Some((mapped, output)) = focus {
+                    self.backend.with_primary_renderer(|renderer| {
+                        if let Err(err) = self.niri.screenshot_window(
+                            renderer,
+                            output,
+                            mapped,
+                            write_to_disk,
+                            show_pointer,
+                            path,
+                            Some(rule),
                         ) {
                             warn!("error taking screenshot: {err:?}");
                         }
@@ -1064,6 +1088,7 @@ impl State {
                 write_to_disk,
                 show_pointer,
                 path,
+                rule,
             } => {
                 let id = MappedId::specific(id);
                 if let Some((mapped, Some(output))) = self.niri.find_mapped_output_by_id(id) {
@@ -1075,6 +1100,7 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
+                            Some(rule),
                         ) {
                             warn!("error taking screenshot: {err:?}");
                         }

@@ -1,4 +1,5 @@
 use core::f64;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
@@ -48,7 +49,7 @@ pub struct Tile<W: LayoutElement> {
     focus_ring: FocusRing,
 
     /// The shadow around the window.
-    shadow: Shadow,
+    shadow: RefCell<Shadow>,
 
     /// This tile's current sizing mode.
     ///
@@ -199,7 +200,7 @@ impl<W: LayoutElement> Tile<W> {
             window,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
-            shadow: Shadow::new(shadow_config),
+            shadow: RefCell::new(Shadow::new(shadow_config)),
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), fullscreen_backdrop_color),
             restore_to_floating: false,
@@ -265,7 +266,7 @@ impl<W: LayoutElement> Tile<W> {
         self.focus_ring.update_config(focus_ring_config);
 
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
-        self.shadow.update_config(shadow_config);
+        self.shadow.borrow_mut().update_config(shadow_config);
 
         self.window.update_config(self.options.blur);
     }
@@ -273,7 +274,7 @@ impl<W: LayoutElement> Tile<W> {
     pub fn update_shaders(&mut self) {
         self.border.update_shaders();
         self.focus_ring.update_shaders();
-        self.shadow.update_shaders();
+        self.shadow.borrow_mut().update_shaders();
     }
 
     pub fn update_window(&mut self) {
@@ -415,7 +416,7 @@ impl<W: LayoutElement> Tile<W> {
         self.focus_ring.update_config(focus_ring_config);
 
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
-        self.shadow.update_config(shadow_config);
+        self.shadow.borrow_mut().update_config(shadow_config);
 
         let fullscreen_backdrop_color = rules
             .fullscreen_backdrop_color
@@ -542,7 +543,7 @@ impl<W: LayoutElement> Tile<W> {
                 .geometry_corner_radius()
                 .scaled_by(1. - expanded_progress as f32)
         };
-        self.shadow.update_render_elements(
+        self.shadow.borrow_mut().update_render_elements(
             animated_tile_size,
             is_active,
             radius,
@@ -772,7 +773,7 @@ impl<W: LayoutElement> Tile<W> {
         Some(self.border.width())
     }
 
-    fn visual_border_width(&self) -> Option<f64> {
+    pub(crate) fn visual_border_width(&self) -> Option<f64> {
         if self.border.is_off() {
             return None;
         }
@@ -841,6 +842,32 @@ impl<W: LayoutElement> Tile<W> {
                 alpha * (1. - p) + 1. * p
             }
         }
+    }
+
+    pub(crate) fn render_shadow<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        location: Point<f64, Logical>,
+        draw_behind_window: bool,
+        push: &mut dyn FnMut(ShadowRenderElement),
+    ) {
+        let expanded_progress = self.expanded_progress();
+        let border_width = self.visual_border_width().unwrap_or(0.);
+        let radius = self
+            .window
+            .geometry_corner_radius()
+            .expanded_by(border_width as f32)
+            .scaled_by(1. - expanded_progress as f32);
+        let mut shadow = self.shadow.borrow_mut();
+        shadow.update_render_elements_draw_behind(
+            self.animated_tile_size(),
+            true,
+            radius,
+            self.scale,
+            1. - expanded_progress as f32,
+            draw_behind_window,
+        );
+        shadow.render(renderer, location, push);
     }
 
     pub fn tile_size(&self) -> Size<f64, Logical> {
@@ -1374,6 +1401,7 @@ impl<W: LayoutElement> Tile<W> {
 
         if expanded_progress < 1. {
             self.shadow
+                .borrow()
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }
 
