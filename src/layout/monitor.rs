@@ -1669,6 +1669,10 @@ impl<W: LayoutElement> Monitor<W> {
         self.fullscreen_window_above_top_layer().is_some()
     }
 
+    pub(crate) fn options(&self) -> &Options {
+        &self.options
+    }
+
     pub fn render_insert_hint_between_workspaces<R: NiriRenderer>(
         &self,
         renderer: &mut R,
