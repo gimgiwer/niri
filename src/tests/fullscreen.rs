@@ -384,3 +384,156 @@ fn maximized_min_size() {
     "
     );
 }
+
+#[test]
+fn fullscreen_backdrop_color_window_rule_transparent() {
+    let config = r##"
+    // Default layout backdrop color is opaque black.
+    window-rule {
+        fullscreen-backdrop-color "transparent"
+        opacity 0.75
+    }
+    "##;
+    let config = Config::parse_mem(config).unwrap();
+    let (mut f, id, surface) = set_up_with_config(config);
+
+    let niri = f.niri();
+    let mapped = niri.layout.windows().next().unwrap().1;
+    let window_id = mapped.window.clone();
+
+    // Toggle fullscreen.
+    niri.layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.ack_last_and_commit();
+    f.roundtrip(id);
+
+    let tile = f.niri().layout.find_tile_for_window(&window_id).unwrap();
+
+    // Window rule overrides backdrop color to transparent.
+    assert_eq!(
+        tile.fullscreen_backdrop_color(),
+        niri_config::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }
+    );
+    // Transparent backdrop must not emit a solid color quad.
+    assert!(!tile.renders_fullscreen_backdrop());
+    // Window preserves its configured opacity since the background is drawn underneath.
+    assert_eq!(tile.effective_window_alpha(), 0.75);
+}
+
+#[test]
+fn fullscreen_backdrop_color_window_rule_custom_hex() {
+    let config = r##"
+    window-rule {
+        fullscreen-backdrop-color "#123456"
+        opacity 0.60
+    }
+    "##;
+    let config = Config::parse_mem(config).unwrap();
+    let (mut f, id, surface) = set_up_with_config(config);
+
+    let niri = f.niri();
+    let mapped = niri.layout.windows().next().unwrap().1;
+    let window_id = mapped.window.clone();
+
+    // Toggle fullscreen.
+    niri.layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.ack_last_and_commit();
+    f.roundtrip(id);
+
+    let tile = f.niri().layout.find_tile_for_window(&window_id).unwrap();
+
+    // Assert exact custom hex color decoded and resolved.
+    let expected_color = niri_config::Color {
+        r: 0x12 as f32 / 255.0,
+        g: 0x34 as f32 / 255.0,
+        b: 0x56 as f32 / 255.0,
+        a: 1.0,
+    };
+    assert_eq!(tile.fullscreen_backdrop_color(), expected_color);
+    // Opaque backdrop quad must be emitted.
+    assert!(tile.renders_fullscreen_backdrop());
+    // Opaque backdrop animates window opacity towards 1.0 at fullscreen.
+    assert_eq!(tile.effective_window_alpha(), 1.0);
+}
+
+#[test]
+fn fullscreen_backdrop_color_fallback_to_layout() {
+    // 1. Fallback to default black layout backdrop when no window-rule matches.
+    {
+        let config = r##"
+        window-rule {
+            match app-id="unmatched-app"
+            fullscreen-backdrop-color "transparent"
+        }
+        "##;
+        let config = Config::parse_mem(config).unwrap();
+        let (mut f, id, surface) = set_up_with_config(config);
+
+        let niri = f.niri();
+        let mapped = niri.layout.windows().next().unwrap().1;
+        let window_id = mapped.window.clone();
+
+        niri.layout.toggle_fullscreen(&window_id);
+        f.double_roundtrip(id);
+        f.client(id).window(&surface).ack_last_and_commit();
+        f.roundtrip(id);
+
+        let tile = f.niri().layout.find_tile_for_window(&window_id).unwrap();
+
+        assert_eq!(
+            tile.fullscreen_backdrop_color(),
+            niri_config::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            }
+        );
+        assert!(tile.renders_fullscreen_backdrop());
+    }
+
+    // 2. Fallback to custom layout backdrop color when no window-rule matches.
+    {
+        let config = r##"
+        layout {
+            fullscreen-backdrop-color "#fedcba"
+        }
+        window-rule {
+            match app-id="unmatched-app"
+            fullscreen-backdrop-color "transparent"
+        }
+        "##;
+        let config = Config::parse_mem(config).unwrap();
+        let (mut f, id, surface) = set_up_with_config(config);
+
+        let niri = f.niri();
+        let mapped = niri.layout.windows().next().unwrap().1;
+        let window_id = mapped.window.clone();
+
+        niri.layout.toggle_fullscreen(&window_id);
+        f.double_roundtrip(id);
+        f.client(id).window(&surface).ack_last_and_commit();
+        f.roundtrip(id);
+
+        let tile = f.niri().layout.find_tile_for_window(&window_id).unwrap();
+
+        let expected_color = niri_config::Color {
+            r: 0xfe as f32 / 255.0,
+            g: 0xdc as f32 / 255.0,
+            b: 0xba as f32 / 255.0,
+            a: 1.0,
+        };
+        assert_eq!(tile.fullscreen_backdrop_color(), expected_color);
+        assert!(tile.renders_fullscreen_backdrop());
+    }
+}
